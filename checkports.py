@@ -1,3 +1,6 @@
+# To execute this python command:
+# python checkports.py [sever_name | server_IP] "port1,port2,port3,port4"
+
 import socket
 import sys
 
