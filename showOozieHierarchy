@@ -1,0 +1,53 @@
+from pathlib import Path
+import argparse, os, re, datetime, subprocess,sys, sqlite3
+from treelib import Node, Tree
+import logging as logger
+
+run_date = datetime.datetime.now().strftime("%Y%m%d_%H%M")
+filePath = "C:/talend/7.0.1/workspace/runtime/context/Default/ENDC_EXT_OOZIE_MAP/ENDC_OOZIE_EXT_HIERARCHY"+"_"+run_date+".txt"
+logname = "ENDC_OOZIE_EXT_HIERARCHY"+"_"+run_date+".log"
+parser = argparse.ArgumentParser()
+#parser.add_argument('-l','--loglevel', type=int, required=True, default='10')
+parser.add_argument('-d','--db', type=str, default='C:/Users/PEREZB2/OneDrive - The Toronto-Dominion Bank/Documents/TD/Talend/AMCB/Oozie Logs/endc_mir_prod_oozie.sqlite') #required=True
+args = vars(parser.parse_args())
+db = args['db']
+connection = sqlite3.connect(db)
+cursor = connection.cursor()
+cursor.execute("select COORD_JOB_ID, WF_JOB_ID from OOZIE_COORD") # WHERE WF_JOB_ID='4255155-210214122615662-oozie-oozi-W'
+rows = cursor.fetchall()
+
+def getNodes(wf):
+    cursor.execute("select distinct WF_JOB_ID , CHILD_WF_ID from OOZIE_WF WHERE WF_JOB_ID='"+wf+"'")
+    wf_rows = cursor.fetchall()   
+    return wf_rows
+
+def getActNodes(wf):
+    #print(wf)
+    cursor.execute("select distinct WF_JOB_ID , ACTION_NAME from OOZIE_ACTION WHERE WF_JOB_ID='"+wf+"'")
+    act_rows = cursor.fetchall()   
+    return act_rows
+
+
+for line in rows:
+    tree = Tree()
+    tree.create_node(line[0], line[0])
+    tree.create_node(line[1], line[1],line[0])
+    wf_rows = getNodes(line[1])
+    if wf_rows is None:
+        continue
+    for wf_line in wf_rows:
+        #print("workflow"+str(wf_line))
+        tree.create_node(wf_line[1], wf_line[1],wf_line[0])
+        sub1_rows = getNodes(wf_line[1])
+        if sub1_rows is None:
+            continue
+        for sub_line in sub1_rows:
+            #print("sub workflow"+str(sub_line))
+            tree.create_node(sub_line[1], sub_line[1],sub_line[0])
+            act_sub_line_rows = getActNodes(sub_line[1])
+            if act_sub_line_rows is None:
+                continue
+            for act_sub_line in act_sub_line_rows:
+                #print("act workflow"+str(act_sub_line))
+                tree.create_node(act_sub_line[0]+"-"+act_sub_line[1], act_sub_line[0]+"-"+act_sub_line[1],act_sub_line[0])
+    tree.save2file(filePath)
