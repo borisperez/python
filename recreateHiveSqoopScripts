@@ -1,0 +1,593 @@
+from pathlib import Path
+import argparse, os, errno, re, datetime, subprocess,sys, sqlite3,shutil,openpyxl
+import logging
+import hashlib as hash
+logger = logging.getLogger(__name__)
+
+class InitDB:
+    """ Initiate the sqlite db created by the TDS Job and create the table HPF_ACTION_MAP in this db """
+    def __init__(self, args):
+        self.db = args['db']
+        self.connection = sqlite3.connect(self.db)
+        self.cursor = self.connection.cursor()
+        self.cursor.execute('DROP TABLE IF EXISTS HPF_ACTION_MAP')
+        self.cursor.execute('CREATE TABLE IF NOT EXISTS HPF_ACTION_MAP(SK TEXT, MAP_ID TEXT,SOURCE_NAME TEXT, TARGET_NAME TEXT, SOURCE_SCHEMA TEXT, TARGET_SCHEMA TEXT, COLUMNS TEXT, DESCRIPTION TEXT, DATABASE TEXT, MALCODE TEXT)')
+
+class Do():
+    """ Utility class with common functions to attend both CreateHiveScript and CreateSqoopScript"""
+    logger.debug("Do function started...")
+    def __init__(self, args):
+        self.path = args['path']
+
+    def dirMaker(self, path):
+        logger.debug("dirMaker path: "+path)
+        if os.path.isdir(path) == False:
+            try:
+                Path(path).mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                if exc.errno != errno.EEXIST:
+                    logger.error(errno.EBADMSG)
+                    raise
+
+    def removeFileIfExist(self, pathfile):
+        logger.debug("remove file if exist : "+pathfile)
+        try: 
+            os.remove(pathfile) 
+            logger.debug("% s removed successfully" % pathfile) 
+        except OSError as error: 
+            print(error) 
+            logger.error("File "+pathfile+" path can not be removed")
+
+    def writeScript(self, pathfile, rows):
+        logger.debug('writeFile() - Started File='+pathfile)
+        if os.path.isfile(pathfile):
+            logger.warning("File "+pathfile+" already exist. Removing file...")
+            self.removeFileIfExist(pathfile)
+        try:
+            with open(pathfile, mode="w+") as w:
+                w.writelines(rows)
+        except OSError as err:
+            print("OS error: {0}".format(err))
+        except:
+            print("Unexpected error:", sys.exc_info()[0])
+    
+    def convListToDict(self, string):
+        key_value = {}
+        for i in string.split("|"):
+            k = i.split("=")
+            key_value[k[0]] = k[1]
+        return key_value
+    
+    def hash(self, text):
+        k = hash.md5()
+        if text is not None:
+            try:
+                k.update(text.encode('utf-8'))
+                return k.hexdigest()
+            except:
+                print('Error to create the Script Hash Key text = '+text)
+                print(hash.algorithms_available)
+                logging.error('Error to create the Script Hash Key text = '+text)
+        else:
+            sys.exit() 
+
+class CreateHiveScript(Do):
+    """ CreateHiveScript Class to read the script extracted from HPF/HDFS, 
+    clean and generate it in EDC agent server to be imported by Talend DataCatalog Bridge"""
+    def __init__(self,args,db):
+        logger.debug("CreateHiveScript started")
+        self.path = args['path']
+        self.Do = Do(args)
+        self.connection = db.connection  
+        self.cursor = db.connection.cursor()
+        self.malcode = args['malcode']
+        self.zone = args['zone']
+
+    def queryHiveHPF(self):
+        """ Function query the sqlite table HPF_EXTRACT_MAP genareted by the TDS job with the Hive scripts. """
+        logger.debug("Querying Hive Action sqlite Table : ")
+        self.cursor.execute("SELECT HPF_KEY_TEXT, HPF_TASK,SCRIPT_HQL FROM HPF_EXTRACT_LOG where SCRIPT_HQL is not 'N' and HPF_KEY_TEXT is not null;")
+        rows = self.cursor.fetchall()
+        self.hivecount = len(rows)
+        logger.debug("Hive Action Table count: "+str(len(rows)))
+        #print(rows)
+        return rows
+
+    def getMalZone(self, script):
+        use_conn_re = re.compile(r"USE [`].{1,}[`]", re.DOTALL)
+        text = script.split('\n')[0]
+        use_conn = re.search(use_conn_re, text)
+        malcode_name = "N"
+        zone_name = "N"
+        if use_conn is not None:
+            schema = use_conn.group().replace("`", "").split("_")
+            malcodes = self.malcode.replace(" ","").split(",")
+            zones = self.zone.replace(" ","").split(",")
+            for name in schema:
+                if name in malcodes:
+                    malcode_name = name
+                if name in zones:
+                    zone_name = name
+            return  malcode_name, zone_name
+        else:
+            return malcode_name, zone_name
+
+    def getTableName(self, keys, malcode, zone):
+        key_values =  self.Do.convListToDict(keys)
+        if 'source_table' in key_values:
+            table = key_values['source_table']
+        elif 'source_view' in key_values:
+            table = key_values['source_view']
+        elif 'target_table' in key_values:
+            table = key_values['target_table']
+        else:
+            table = 'N'
+        if 'task' in key_values:
+            hpf_type = key_values['task']
+        else:
+            hpf_type = 'N'
+        return malcode+"-"+zone+"-"+hpf_type+"-"+table    
+    
+
+
+    def makeHQLScripts(self):
+        """ Function execute the hive script genaretion. """
+        logger.debug("runMakeHQLScripts started")
+        rows = self.queryHiveHPF()
+        hqlcount = 0
+        for records in rows:
+            hqlcount += 1
+            malcode, zone = self.getMalZone(records[2])
+            path = self.path+"/hql/"+malcode+"/"+zone
+            hql_name = self.getTableName(records[0], malcode, zone)
+            self.Do.dirMaker(path)
+            hqlClean = path+"/"+hql_name+".hql"
+            logger.info("Creating HQL Script "+hqlClean)
+            count = 0
+            with open(hqlClean, mode="w+") as w:
+                w.writelines(records[2])
+        self.hqlcount = hqlcount
+
+class CreateSqoopScript(Do):
+    """ This CreateHiveScript Class, read the Sqoop parameters and Columns files extracted from HPF/HDFS, 
+    and generate the sqoop scripts in EDC agent server to be imported by Talend DataCatalog Bridge. """
+    def __init__(self,args,db):
+        logger.debug("CreateSqoopScript started")
+        self.path = args['path']
+        self.Do = Do(args)
+        self.connection =  db.connection   
+        self.cursor = db.connection.cursor()
+        self.malcode = args['malcode']
+        self.zone = args['zone']
+        self.keepsqoop = args['keepSqoop']
+
+    
+    def saveHpfMap(self, map):
+        """ Function Save the HPF parse log info in the sqlite table HPF_EXTRACT_LOG """
+        try:
+            self.cursor.execute('INSERT INTO HPF_ACTION_MAP VALUES (?,?,?,?,?,?,?,?,?,?)' , ( map['SK'], map['Id'], map['source_table'].strip(), map['target_table'].strip(), map['source_schema'].strip(), \
+                 map['target_schema'].strip(), map['columns'].strip(), map['description'].strip() , map['database'].strip(), map['malcode'].strip()))
+            rows = self.cursor.rowcount       
+            self.connection.commit()
+            self.cursor.close
+            return rows
+        except sqlite3.Error as e:
+            print("Error to insert HPF Action Map  :", e.args[0])
+            logger.error("Error to insert HPF Action Map :", e.args[0])
+        #self.cursor.execute('CREATE TABLE IF NOT EXISTS HPF_ACTION_MAP(SOURCE_NAME TEXT, TARGET_NAME TEXT, SOURCE_SCHEMA TEXT, TARGET_SCHEMA TEXT, SOURCE_MODEL TEXT, TARGET_MODEL TEXT, COLUMNS TEXT, POSITION TEX, DESCRIPTION TEXT, DATABASE TEXT, MALCODE TEXT)')
+
+    def querySqoopHPF(self):
+        """ Function query the sqlite table HPF_EXTRACT_MAP genareted by the TDS job with the Hive scripts. """
+        logger.debug("Querying Hive Action sqlite Table : ")
+        self.cursor.execute("SELECT HPF_TASK, TASK_KEY, HPF_TASK,SCRIPT_SQOOP FROM HPF_EXTRACT_LOG where SCRIPT_SQOOP is not 'N' and HPF_KEY_TEXT is not null;")
+        rows = self.cursor.fetchall()
+        self.sqooprowscount = len(rows)
+        logger.debug("Hive Action Table count: "+str(len(rows)))
+        return rows
+    
+    def queryHPFModel(self):
+        """ Function query all model information from the sqlite table HPF_EXTRACT_MAP genareted by the TDS job with the Hive scripts. """
+        #logger.debug("Querying Hive Action sqlite Table : ")
+        self.cursor.execute("SELECT DISTINCT TABLE_NAME, SCHEMA_NAME ,MODEL_TYPE ,COLUMNS, DESCRIPTION, MALCODE \
+                            FROM ( \
+                               SELECT SK, MAP_ID, SOURCE_NAME as TABLE_NAME, SOURCE_SCHEMA as SCHEMA_NAME \
+                                     ,'hive' as MODEL_TYPE, COLUMNS, DESCRIPTION, DATABASE, MALCODE \
+                               FROM HPF_ACTION_MAP \
+                               WHERE (SK,MAP_ID) IN \
+                                   (SELECT MAX(SK), MAP_ID FROM HPF_ACTION_MAP GROUP BY MAP_ID) and TARGET_NAME is not 'SRC_CNTRL_LST' \
+                            UNION \
+                                SELECT SK, MAP_ID, TARGET_NAME as TABLE_NAME, TARGET_SCHEMA as SCHEMA_NAME \
+                                    ,'ORACLE' as MODEL_TYPE, COLUMNS, DESCRIPTION, DATABASE, MALCODE \
+                                FROM HPF_ACTION_MAP \
+                                WHERE (SK,MAP_ID) IN \
+                                    (SELECT MAX(SK), MAP_ID FROM HPF_ACTION_MAP GROUP BY MAP_ID)  and TARGET_NAME is not 'SRC_CNTRL_LST' \
+                                ) \
+                            WHERE TABLE_NAME is not 'SRC_CNTRL_LST' \
+                            ORDER BY MALCODE, SCHEMA_NAME, TABLE_NAME;")
+        rows = self.cursor.fetchall()
+        self.modelcount = len(rows)
+        #logger.debug("HPF Action Map Table Model count: "+str(len(rows)))
+        return rows
+    
+    def queryHPFMap(self):
+        """ Function query the sqlite table HPF_EXTRACT_MAP genareted by the TDS job with the Hive scripts. """
+        logger.debug("Querying Hive Action sqlite Table : ")
+        self.cursor.execute("SELECT SK, MAP_ID, SOURCE_NAME, TARGET_NAME, SOURCE_SCHEMA, TARGET_SCHEMA, COLUMNS, DESCRIPTION, DATABASE, MALCODE \
+                            FROM HPF_ACTION_MAP \
+                            WHERE (SK,MAP_ID) IN (SELECT MAX(SK), MAP_ID FROM HPF_ACTION_MAP GROUP BY MAP_ID) and TARGET_NAME is not 'SRC_CNTRL_LST' \
+                            ORDER BY MALCODE ;")
+        rows = self.cursor.fetchall()
+        self.mapcount = len(rows)
+        logger.debug("HPF Action Map Table Map count: "+str(len(rows)))
+        return rows
+
+    def sqoopFactory(self, sqoopKeyValue,sqoopScriptPath):
+        """ Function decide what type of Sqoop script will be generated ex: export/import. """
+        if (sqoopKeyValue['sqoop_type'] is None):
+            return None
+        elif (sqoopKeyValue['sqoop_type'] == 'export' ):
+            logger.info("Creating Export Sqoop Script "+sqoopKeyValue['sqoop_table'])
+            script = self.sqoopExport(sqoopKeyValue)
+            self.Do.writeScript(sqoopScriptPath, script)
+            return script
+        else:
+            logger.error("Sqoop Type not estimate yet "+sqoopKeyValue['sqoop_type'])
+            print("Sqoop Type not estimate yet "+sqoopKeyValue['sqoop_type'])
+            return None
+
+    def sqoopExport(self, params):
+        """ Function generate the Sqoop export script. """
+        script = 'sqoop export '+params['sqoop_connect']+" \\"+'\n'+params['sqoop_username'] \
+        +" \\"+'\n'+params['sqoop_password']+" \\"+'\n'+params['sqoop_table']+" \\"+'\n'+params['sqoop_columns'] \
+        +" \\"+'\n'+params['sqoop_tabledir']+" \\"+'\n'+params['sqoop_field_delimiter']+" , "+params['sqoop_line_delimiter']
+        return script
+    
+    def formatSqoop(self, sqoopLine, columns):
+        """ Function to get Sqoop list extracted from the log and format the sqoop comand in order to produce the sqoop script. """
+        logger.debug("formatSqoop started")
+        sqoopList = sqoopLine.replace("'", "").replace(" ", "").split(",")
+        if len(sqoopList) == 0:
+            return "N"
+        else:
+            sqoopKeys = {}
+            previousLine = ""
+            sqoopKeys['sqoop_columns'] = '--columns "' + columns +'"'
+            sqoopKeys['columns'] = columns
+            sqoopKeys['sqoop_line_delimiter'] = "--input-lines-terminated-by \'\\b\'"
+            sqoopKeys['sqoop_field_delimiter'] = "--input-fields-terminated-by \',\'"
+            for line in sqoopList:
+                #print(line)
+                line = line.strip().replace("]", "")
+                if (line == 'export') or (line == 'import' ) or (line == 'import-all-tables') or (line == 'merge'):
+                        #print("Type line "+line)
+                        sqoopKeys['sqoop_type'] = line
+                if ("--connect" in previousLine):
+                    #print("Connect line"+line)
+                    a = line.split("/")
+                    b = a[len(a)-1].split(".")[0]
+                    sqoopKeys['database'] = b
+                    sqoopKeys['sqoop_connect'] = "--connect "+line
+                elif ("--username" in previousLine):
+                    sqoopKeys['username'] = line
+                    sqoopKeys['sqoop_username'] = "--username "+ line
+                elif ("--password-file" in previousLine):
+                    sqoopKeys['sqoop_password'] = "--password-file "+ line  
+                elif ("--export-dir" in previousLine):
+                    sqoopKeys['tabledir'] = line
+                    sqoopKeys['sqoop_tabledir'] = "--export-dir "+line
+                elif ("--table" in previousLine):
+                    if (len(line.split(".")) == 2):
+                        sqoopKeys['schema'] = line.split(".")[0]
+                        sqoopKeys['tableName'] = line.split(".")[1].replace("]","")
+                    sqoopKeys['sqoop_table'] = "--table "+line
+                previousLine = line
+        return sqoopKeys
+    
+    def getScriptColumns(self, key_values):
+        if 'source_columns' in key_values:
+            #print(key_values['source_columns'])
+            return key_values['source_columns']
+        else:
+            return "N"
+            
+    def convStringToDict(self, string):
+        text = string.split("|")
+        key_value = {}
+        if text is not  None:
+            for i in text:
+                k = i.strip(")(").replace("'", "").split(",")
+                if k is not None:
+                    if len(k[1:]) == 1:
+                        value = ''.join(k[1:]).strip().replace(" ", "")
+                    else:
+                        value = ','.join(k[1:]).strip().replace(" ", "")
+                    key_value[k[0]] = value
+                else:
+                    continue
+        #print(key_value)        
+        return key_value
+    
+    def getMalZone(self, key_values):
+        malcode_name = "N"
+        zone_name = "N"
+        if 'source_schema' in key_values:
+            schema = key_values['source_schema'].lower()
+        else:
+            logger.error("Source schema not found")
+            return 'N', 'N'
+        malcodes = self.malcode.replace(" ","").split(",")
+        zones = self.zone.replace(" ","").split(",")
+        for name in schema.split("_"):
+            if name in malcodes:
+                malcode_name = name
+            if name in zones:
+                zone_name = name
+        return  malcode_name, zone_name, schema
+
+    def validSqoop(self, sqoopKeys):
+        """ Validate the Sqoop params. """
+        valid = True
+        if (sqoopKeys['sqoop_type'] is None):
+            valid = False
+        if (sqoopKeys['sqoop_connect'] is None):
+            valid = False
+        if (sqoopKeys['sqoop_tabledir'] is None):
+            valid = False
+        if (sqoopKeys['sqoop_table'] is None):
+            valid = False
+        if (sqoopKeys['sqoop_columns'] is None):
+            valid = False
+        if (sqoopKeys['sqoop_username'] is None):
+            sqoopKeys['sqoop_username'] = "--username TDCRPT"
+        if (sqoopKeys['sqoop_password'] is None):
+            sqoopKeys['sqoop_password'] = "--password-file /apps/talend/password/password.txt"    
+        if (sqoopKeys['sqoop_field_delimiter'] is None):
+            sqoopKeys['sqoop_field_delimiter'] = "--input-fields-terminated-by \',\'"
+        if (sqoopKeys['sqoop_line_delimiter'] is None):
+            sqoopKeys['sqoop_line_delimiter'] = "--input-lines-terminated-by \'\\n\'"
+        return valid
+
+    def getTableName(self, key_values):
+        #print(key_values)
+        if 'source_table' in key_values :
+            table = key_values['source_table']
+        elif 'source_view' in key_values:
+            table = key_values['source_view']
+        else:
+            table = 'N'
+        return table 
+
+    def makeSqoopScripts(self):
+        """ Function execute the hive script genaretion. """
+        logger.debug("runMakeHQLScripts started")
+        rows = self.querySqoopHPF()
+        sqoopcount = 0
+        map = {}
+        for records in rows:
+            key_values = self.convStringToDict(records[1])
+            #print(key_values)
+            malcode, zone, schema = self.getMalZone(key_values)
+            pathsqoop = self.path+"/sqoop/"+malcode+"/"+zone
+            source_table = self.getTableName(key_values)
+            sqoop_name = malcode+"-"+zone+"-"+records[0]+"-"+source_table
+            columns = self.getScriptColumns(key_values)
+            if columns != 'N':
+                sqoopKeys = self.formatSqoop(records[3], columns)
+            else:
+                logger.error("Sqoop Script do not have columns")
+                continue
+            if (self.validSqoop(sqoopKeys) and malcode != 'N'):
+                self.Do.dirMaker(pathsqoop)
+                sqoop_script_name = pathsqoop+"/"+sqoop_name+".sqoop"
+                if (self.keepsqoop.lower() == 'yes'):
+                    sqoop_script = self.sqoopFactory(sqoopKeys, sqoop_script_name)
+                sqoopcount += 1
+                map['malcode'] = malcode.strip()
+                map['source_schema'] = schema.strip()
+                map['source_table'] = source_table.strip()
+                map['columns'] = sqoopKeys['columns'].strip()
+                map['target_schema'] = sqoopKeys['schema'].strip()
+                map['target_table'] = sqoopKeys['tableName'].strip()
+                #map['description'] = "HPF "+malcode.strip()+" Map Process to map the source table "+schema.strip()+"."+source_table.strip()+" with the target table "+sqoopKeys['schema'].strip()+"."+sqoopKeys['tableName'].strip()
+                map['description'] = sqoop_script
+                map['database'] = sqoopKeys['database'].strip()
+                map['SK'] = sqoopcount
+                map['Id'] = self.Do.hash(malcode.strip()+"_"+schema.strip()+"_"+source_table.strip()+"_"+sqoopKeys['schema'].strip()+"_"+sqoopKeys['tableName'].strip())
+                self.saveHpfMap(map)
+                logger.info("Created Sqoop Script "+sqoop_script_name)
+        self.sqcount = sqoopcount
+        return sqoopcount
+    
+    def copyTemplate(self,malcode,path, template):
+        mapfilename = ''.join(('mapping_',malcode, '_hdfs.xlsx'))
+        mapfile = os.path.join(path, mapfilename)
+        logger.info(mapfile)
+        if os.path.exists(template):
+            try:
+                if os.path.exists(mapfile): os.remove(mapfile)
+            except OSError as err:
+                logger.error("Can not remove mapfile " + mapfile)
+                print("Can not remove mapfile " + mapfile)
+                raise
+            try:
+                shutil.copyfile(template,mapfile)
+            except shutil.Error as err:
+                logger.error("Can not copy template "+template+" file to the mapfile " + mapfile)
+                print("Can not copy template "+template+" file to the mapfile " + mapfile)
+                raise
+        else:
+            logger.error('Can not find template file ' + template)
+            print('Can not find template file ' + template)
+            sys.exit(1)
+        return mapfile
+     
+    def openMap(self, mapfile):
+        try:
+            map = openpyxl.load_workbook(mapfile)
+            return map
+        except Exception as err:
+            logger.error('Can not open mapfile ' + mapfile)
+            print('Can not open mapfile ' + mapfile)
+            print(err.message)
+            logger.error(err.message)
+            raise
+
+    def createMap(self):
+        """process links from EDPP HDFS out model to AxiomServerFiles model"""
+        logger.debug("create Map started")
+        # Start fill the Map Tab
+        malcode = ""
+        mapping_name = ""
+        mapfile = None
+        map = None
+        rows = self.queryHPFMap()
+        #print(rows)
+        for row in rows:
+            #print(row)
+            if (row[9] != malcode):
+                logger.debug("Creating a new mapfile to malcode "+row[9]+" previous mapfile malcode "+malcode)
+                print("Creating a new mapfile to malcode "+row[9]+" previous mapfile malcode "+malcode)
+                #print(row[9])
+                path = os.path.join(self.path,'mapping',row[9])
+                self.Do.dirMaker(path)
+                if (map != None):
+                    logger.debug("Close Map "+str(mapfile))
+                    map.save(mapfile)
+                    map.close()
+                mapfile = self.copyTemplate(row[9],path,"mapping_template.xlsx")
+                map = openpyxl.load_workbook(mapfile)
+                mapTabModel = map['Models']
+                mapTabMapping = map['Mappings']
+                r = 4
+                k = 0
+            else:
+                print("mantem o arquivo atual")    
+            for column in row[6].split(","):
+                if (mapping_name != row[4]+"-"+row[2]+"_"+row[5]+"-"+row[3]):
+                    mapTabMapping['A' + str(r+k)] = row[4]+"-"+row[2]+"_"+row[5]+"-"+row[3]
+                    #mapTabMapping['C' + str(r+k)] = str(row1[5])
+                    mapTabMapping['R' + str(r+k)] = row[4].strip()
+                    mapTabMapping['S' + str(r+k)] = row[4].strip()
+                    mapTabMapping['T' + str(r+k)] = row[2].strip()
+                    mapTabMapping['AQ' + str(r+k)] = row[3].strip()
+                    mapTabMapping['AR' + str(r+k)] = row[5].strip()
+                    mapTabMapping['AS' + str(r+k)] = row[5].strip()
+                    mapTabMapping['V' + str(r+k)] = column.strip()
+                    mapTabMapping['AP' + str(r+k)] = column.strip()
+                    smodel = row[4]
+                    tmodel = row[5]
+                    sshema = row[4]
+                    tschema = row[5]
+                    stable = row[2]
+                    ttable = row[3]
+                    logger.debug("Mapping Name "+sshema+"-"+stable+"_"+tschema+"-"+ttable+" Column "+column)
+                    print("Mapping Name "+sshema+"-"+stable+"_"+tschema+"-"+ttable+" Column "+column)
+                else:
+                    mapTabMapping['A' + str(r+k)] = ''
+                    #mapTabMapping['C' + str(r+k)] = str(row1[5])
+                    mapTabMapping['R' + str(r+k)] = ''
+                    mapTabMapping['S' + str(r+k)] = ''
+                    mapTabMapping['T' + str(r+k)] = ''
+                    mapTabMapping['AQ' + str(r+k)] = ''
+                    mapTabMapping['AR' + str(r+k)] = ''
+                    mapTabMapping['AS' + str(r+k)] = ''
+                    mapTabMapping['V' + str(r+k)] = column.strip()
+                    mapTabMapping['AP' + str(r+k)] = column.strip()
+                    logger.debug(" Column "+column)
+                    print(" Column "+column)
+                k += 1
+                mapping_name = sshema+"-"+stable+"_"+tschema+"-"+ttable   
+            malcode = row[9]
+        if (map != None):
+            map.save(mapfile)    
+            map.close()
+        # Start fill the Model Tab
+        rows = self.queryHPFModel()
+        path = ""
+        malcode = ""
+        mapping_name = ""
+        mapfile = None
+        map = None
+        for row in rows:
+            if (row[5] != malcode):
+                logger.debug("Open the file malcode "+row[5]+" malcode anterior "+malcode)
+                #print(row[8])
+                path = os.path.join(self.path,'mapping', row[5])
+                if (map != None):
+                    print("Close Map "+str(mapfile))
+                    map.save(mapfile)
+                    map.close()
+                mapfilename = ''.join(('mapping_',row[5], '_hdfs.xlsx'))
+                mapfile = os.path.join(path, mapfilename)
+                map = self.openMap(mapfile)
+                mapTabModel = map['Models']
+                r = 4
+                j = 0
+            else:
+                print("mantem o arquivo atual")    
+            for column in row[3].split(","):
+                logger.debug("Current Model Map: "+row[1]+"."+row[0]+" previous Map: "+mapping_name)
+                if (mapping_name != row[1]+"."+row[0]):
+                    mapTabModel['A' + str(r+j)] = row[1].strip()
+                    mapTabModel['B' + str(r+j)] = row[2].strip()
+                    mapTabModel['K' + str(r+j)] = row[1].strip()
+                    mapTabModel['M' + str(r+j)] = row[0].strip()
+                    mapTabModel['Q' + str(r+j)] = row[4].strip()
+                    mapTabModel['AJ' + str(r+j)] = column.strip()
+                    model = row[1]
+                    shema = row[1]
+                    table = row[0]
+                    logger.debug("Model Name "+shema+"-"+table+" Column "+column)
+                    print("Model Name "+shema+"-"+table+" Column "+column)
+                else:
+                    mapTabModel['A' + str(r+j)] = ''
+                    mapTabModel['B' + str(r+j)] = ''
+                    mapTabModel['K' + str(r+j)] = ''
+                    mapTabModel['M' + str(r+j)] = ''
+                    mapTabModel['AJ' + str(r+j)] = column.strip()
+                    model = row[1]
+                    shema = row[1]
+                    table = row[0]
+                    logger.debug(" Column "+column)
+                    print(" Column "+column)
+                j += 1
+                mapping_name = shema+"."+table
+            malcode = row[5]
+            logger.info("Map File "+mapfile+" mapping records created: " + str(k)+" models records created: "+ str(j))
+        if (map != None):
+            map.save(mapfile)    
+            map.close()
+        
+def main():
+    db = ''
+    run_date = datetime.datetime.now().strftime("%Y%m%d_%H%M")
+    logname = "ENDC_HPF_EXT_SQOOP_HIVE_SCRIPT"+"_"+run_date+".log"
+    parser = argparse.ArgumentParser()
+    parser.add_argument('-g','--logpath', type=str, default='C:\\Users\\PEREZB2\\Downloads\\logs')
+    parser.add_argument('-l','--loglevel', type=int,  default='20')
+    parser.add_argument('-d','--db', type=str,  default='C:/talend/7.0.1/workspace/db/ENDC_EXT_HPF_MAP/endc_mir_prod_hpf_actions.sqlite')
+    parser.add_argument('-p','--path', type=str,  default='C:\\Users\\PEREZB2\\OneDrive - The Toronto-Dominion Bank\\Documents\\TD\\Talend\\AMCB\\HPF\\scripts') #required=True,
+    parser.add_argument('-m','--malcode', type=str,  default='edw2,cai,cl3n,cprb,encmp,encompass,hmt,liq,lwk,mas,ofcr,spr,stb,tcus5,vpls,shw,tdafa,fisa1,eym,xprn,ncno,avalon')
+    parser.add_argument('-z','--zone', type=str,  default='stage,in,out')
+    parser.add_argument('-k','--keepSqoop', type=str,  default='yes')
+
+    args = vars(parser.parse_args())
+    log = args['logpath']+"/"+logname
+    logging.basicConfig(level=args['loglevel'], filename=log, format='%(asctime)s %(funcName)s %(levelname)s: %(message)s', datefmt='%d/%m/%Y %H:%M:%S')
+    logger.info('******** HPF Extract Hive and Sqoop Creation Started : ')
+    db = InitDB(args)
+    #print(db)
+    sqoop = CreateSqoopScript(args, db)
+    sqoop.makeSqoopScripts()
+    sqoop.createMap()
+    hive = CreateHiveScript(args, db)
+    hive.makeHQLScripts()
+    
+    logger.info("Number of sqoop script found :"+str(sqoop.sqooprowscount)+" Number of sqoop scripts created :"+str(sqoop.sqcount))
+    logger.info("Number of Maps created :"+str(sqoop.mapcount)+" Number of models created :"+str(sqoop.modelcount))
+    logger.info("Number of Hive script found :"+str(hive.hivecount)+" Number of hql scripts created :"+str(hive.hqlcount))
+    print('******** HPF Map Extract Hive, Sqoop and Excel Map Creation Ended : '+datetime.datetime.now().strftime("%Y%m%d_%H%M"))
+    logger.info('******** HPF Map Extract Hive, Sqoop and Excel Map Creation End : '+datetime.datetime.now().strftime("%Y%m%d_%H%M"))
+
+if __name__ == "__main__":
+    main()
