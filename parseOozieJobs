@@ -1,0 +1,720 @@
+#! /opt/anaconda/anaconda-notebooks/bin/python
+
+# The script has a functionalitie to get a list of Oozie Job Coordinate, find all workflow and subworkflow executed from the coordinate
+# until get the the action jobs. After tha the script will get parse the action properties and definitions in order to get all information need
+# to compose the the data source metadata and the data target metadata
+import argparse, os, datetime, subprocess, re, sys, sqlite3
+import pandas as pd
+import xml.etree.ElementTree as etree
+import logging as logger
+import hashlib as hash
+
+jobPattern = re.compile(r'\d{7}-\d{15}-oozie-oozi-[W|C]')
+run_date = datetime.datetime.now().strftime("%Y%m%d_%H%M")
+logname = "ENDC_OOZIE_EXTRACT"+"_"+run_date+".log"
+dbf = 'endc_oozie_extract_' + run_date + '.sqlite'
+filters=[]
+job_limite = 0
+status_filter = ""
+xml_files_folder=""
+hdfs_script_folder = ""
+oozie_url=""
+tdc_log_folder=""
+extract_oozie_db = ""
+db_connection = ""
+db = ""
+cursor = ""
+keep_files = ""
+loglevel = ""
+#********* Util Module Start *********
+# set the parameter with the information collected from the context file
+# Execute a any command line in the operational system ex: OS, Shell script, Oozie cmd...
+def execCmd(command):
+    logger.debug('execCmd() - Command = '+command)
+    try:
+        process = subprocess.Popen(command,shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        stdout, stderr = process.communicate()
+        return_code = process.poll()
+        logger.debug('stdout = '+stdout.decode('utf-8'))
+        if return_code == 0:
+            return stdout.decode('utf-8'), return_code
+        else:
+            print("Return code "+str(return_code)+" Error :"+stderr.decode('utf-8'))
+            return stderr.decode('utf-8'), return_code
+    except OSError as err:
+        print("OS error: {0}".format(err))
+        logger.error("OS error: {0}".format(err))
+    except:
+        print("Unexpected error:", stderr.decode('utf-8'))
+        logger.error('stderr = '+stderr.decode('utf-8')+ 'Return Code= '+return_code)
+
+def kerb_auth(keytab, user): # kerberos authorization
+    cmd = 'kinit -kt ' + keytab + ' ' + user
+    stdout, return_code = execCmd(cmd)
+    if return_code == 0:
+        logger.info('Kerberos Authentication Done ')
+    else:
+        logger.error('Failed to execute Kerberos Authentication'+stdout)
+    return return_code
+
+def setParams(dictionary, param):
+    for key, value in dictionary.items():
+        if key == param:
+            print('Parameter --> '+key+' = ', end=' ')
+            print(value)
+            return value
+        else:
+            continue
+
+# Read the context file
+def readContextFile(filePath):
+    params = {}
+    try:
+        with open(filePath, mode="r") as r:
+            for line in r.read().splitlines():
+                print(line)
+                if line.find('=') > 0 and line.find('#') == -1:
+                    (key, val) = line.split('=')
+                    if len(val.split(',')) >1:
+                        params[key.strip()] = val.strip().split(',')
+                    else:
+                        params[key.strip()] = val.strip()
+    except OSError as err:
+        print("OS error: {0}".format(err))
+    except:
+        print("Unexpected error:", sys.exc_info()[0])
+    return params
+
+# Write a file, the function will first remove the file if it already exist calling the removeFileIfExist() function
+def writeFile(filePath, rows):
+    logger.debug('writeFile() - Started File='+filePath)
+    if os.path.isfile(filePath):
+        logger.warning("File"+filePath+"already exist. Removing file...")
+        removeFileIfExist(filePath)
+    try:
+        with open(filePath, mode="w+") as w:
+            w.writelines(rows)
+    except OSError as err:
+        print("OS error: {0}".format(err))
+    except:
+        print("Unexpected error:", sys.exc_info()[0])
+
+# Remove a file from the system
+def removeFileIfExist(filePath):
+    stdout, return_code = execCmd('rm -f '+filePath)
+    if return_code == 0:
+        logger.info('File already exist and was deleted '+filePath)
+    else:
+        logger.error('Failed to delete file '+stdout)
+    return return_code
+
+# Convert the parameter ex: ${param} for it's value in a string. The string can have many parameters
+# it will convert all of them if the function can find the parameter key/value in the dictionary keyValueDict
+def paramToValue(string, keyValueDict):
+    logger.debug('paramToValue() - Started string: '+string)
+    pattern = re.compile(r'\${[\w]+}')
+    paramList = re.findall(pattern,string)
+    for paramText in paramList:
+        paramName = paramText.replace('${', "").replace('}',"")
+        paramValue = keyValueDict.get(paramName)
+        if paramValue:
+            string = string.replace(paramText,paramValue)
+        else:
+            continue
+        if string.find("#") >= 1:
+            string = string.split('#')[0]
+    logger.debug('paramToValue() - End result:' +string)
+    return string
+
+def hashKey(text):
+    k = hash.md5()
+    if text is not None:
+        try:
+            k.update(text.encode('utf-8'))
+            return k.hexdigest()
+        except:
+            print('Error to create the Script Hash Key text = '+text)
+            print(hash.algorithms_available)
+            logger.error('Error to create the Script Hash Key text = '+text)
+    else:
+        sys.exit()
+
+#********* Util Module End *********
+
+# Initiate the OOZIE EXTRACT SQLITE Database
+def init_db():
+    try:
+        db = extract_oozie_db+'/'+dbf
+        if os.path.exists(db): os.remove(db)
+        global db_connection
+        db_connection = sqlite3.connect(db)
+        global cursor
+        cursor = db_connection.cursor()
+        cursor.execute('CREATE TABLE OOZIE_ACTION (WF_JOB_ID TEXT, ACTION_TYPE TEXT, PARAM_XML TEXT, ACTION_NAME TEXT, APP_XML TEXT,SCRIPT_PATH TEXT, CLEAN_SCRIPT_HASH TEXT, CLEAN_SCRIPT TEXT, ORIGIN_SCRIPT_HASH TEXT, ORIGIN_SCRIPT TEXT, ACTION_FROM TEXT)')
+        cursor.execute('CREATE TABLE OOZIE_COORD (COORD_JOB_ID TEXT, COORD_APP_PATH TEXT, STATUS TEXT, MAT_CNT TEXT,MAT_DATE TEXT, WF_JOB_ID TEXT)')
+        cursor.execute('CREATE TABLE OOZIE_WF (WF_JOB_ID TEXT, CHILD_WF_ID TEXT, WF_APP_PATH TEXT, DEF_XML TEXT,CONF_XML TEXT, APP_XML TEXT, WF_DATE TEXT, WF_STATUS TEXT)')
+        logger.debug('init_db() - Temp Tables Created.')
+        db_connection.commit()
+    except sqlite3.Error as sqlerror:
+        logger.error('Error to create the sqllite database error '+sqlerror)
+        print('Error to create the sqllite database error '+sqlerror)
+
+
+# Setup the global parameters, looging file/mode and the sqlite db
+def setUp():
+    context = ""
+    paramDict = {}
+    parser = argparse.ArgumentParser()
+    parser.add_argument('-c','--context', type=str, required=True)
+    parser.add_argument('-l','--loglevel', type=str, default='')
+    parser.add_argument('-d','--db', type=str)
+    parser.add_argument('-k','--keytab', type=bool, default=False)
+    parser.add_argument('-u','--user', type=str, default='')
+    args = parser.parse_args()
+    #if len(args.context) > 0:
+    if args.context :
+        context = args.context
+    else:
+        sys.exit()
+    paramDict = readContextFile(context)
+    global filters
+    filters = setParams(paramDict, 'filter')
+    global xml_files_folder
+    xml_files_folder = setParams(paramDict, 'xml_files_folder')
+    global oozie_url
+    oozie_url = setParams(paramDict, 'oozie_url')
+    global hdfs_script_folder
+    hdfs_script_folder = setParams(paramDict, 'hdfs_script_folder')
+    global extract_oozie_db
+    extract_oozie_db = setParams(paramDict, 'extract_oozie_db')
+    global tdc_log_folder
+    tdc_log_folder = setParams(paramDict, 'tdc_log_folder')
+    global status_filter
+    status_filter = setParams(paramDict, 'status_filter')
+    global job_limite
+    job_limite = setParams(paramDict, 'job_limite')
+    global keep_files
+    keep_files = setParams(paramDict, 'keep_files')
+    global loglevel
+    loglevel = args.loglevel
+    if loglevel == '':
+        loglevel=setParams(paramDict, 'loglevel')
+    else:
+        print('Parameter --> loglevel = '+loglevel)
+    level = getattr(logger, loglevel.upper(), None)
+    if not isinstance(level, int):
+        raise ValueError('Invalid log level: %s'+level)
+    formatter = '%(asctime)s - %(levelname)s : %(message)s'
+    logger.basicConfig(filename=tdc_log_folder+"/"+logname, filemode='w', level=level,format=formatter)
+    if  (args.keytab == True and args.user == True):
+        kerb_auth(args.keytab, args.user)
+    else:
+        kerb_auth(setParams(paramDict, 'tdc_edpp_keytab'), setParams(paramDict, 'tdc_edpp_user'))
+    print('******** Oozie Extract Job Started : '+run_date)
+    print()
+    logger.info('******** Oozie Extract Job Started : '+run_date)
+    logger.info('********Setting Parameters:********')
+    logger.info('Context File = '+context)
+    logger.info('Filters =')
+    logger.info(filters)
+    logger.info('xml_files_folder = '+xml_files_folder)
+    logger.info('oozie_url = '+oozie_url)
+    logger.info('loglevel = '+loglevel)
+    logger.info('tdc_log_folder = '+tdc_log_folder)
+    logger.info('extract_oozie_db = '+extract_oozie_db)
+    logger.info('hdfs_script_folder = '+hdfs_script_folder)
+    logger.info('User = '+hdfs_script_folder)
+    logger.info('hdfs_script_folder = '+hdfs_script_folder)
+    if args.db is None:
+        init_db()
+    else:
+        global db_connection
+        db_connection = sqlite3.connect(args.db)
+        global cursor
+        cursor = db_connection.cursor()
+    logger.info('********setUp() - Done.')
+    #parser.add_argument('-k','--kerb_auth', type=bool, default=False)
+    #parser.add_argument('-u','--user', type=str, default='')
+    #parser.add_argument('-kt','--keytab', type=str, default='')
+
+# Create the OOZIE_ACTION table in the sqllite database
+#OOZIE_ACTION (WF_JOB_ID TEXT, ACTION_TYPE TEXT, PARAM_XML TEXT, ACTION_NAME TEXT,APP_XML TEXT, SCRIPT_PATH TEXT, SCRIPT_HASH TEXT, SCRIPT TEXT)
+def saveAction(action, cleanScript, originScript):
+    try:
+        cursor.execute('INSERT INTO OOZIE_ACTION VALUES (?,?,?,?,?,?,?,?,?,?,?)',(action['jobid'],action['type'],action['params'] , action['name'], action['appXML'], action['scriptpath'], hashKey(cleanScript), cleanScript, hashKey(originScript),originScript, action['actionfrom']))
+        db_connection.commit()
+    except sqlite3.Error as e:
+        print("Error to insert action jobid:"+action['jobid'], e.args[0])
+        logger.error("Error to insert action jobid:"+action['jobid'], e.args[0])
+
+# Create the OOZIE_COORD table in the sqllite database
+#OOZIE_COORD (COORD_JOB_ID TEXT, COORD_APP_PATH TEXT, STATUS TEXT, MAT_CNT TEXT,MAT_DATE TEXT, WF_JOB_ID TEXT)
+def saveCoordinate(job):
+    try:
+        cursor.execute('INSERT INTO OOZIE_COORD VALUES (?,?,?,?,?,?)', (job['jobid'], job['JobPath'],  job['status'],  job['MatCNT'], job['JobCreation'], job['ChildJob']))
+        db_connection.commit()
+    except sqlite3.Error as e:
+        print("Error to insert action job:"+job, e.args[0])
+        logger.error("Error to insert action job:"+job, e.args[0])
+
+# Create the OOZIE_WF table in the sqllite database
+#OOZIE_WF (WF_JOB_ID TEXT, CHILD_WF_ID TEXT, WF_APP_PATH TEXT, DEF_XML TEXT,CONF_XML TEXT, APP_XML TEXT, WF_DATE TEXT, WF_STATUS TEXT)
+def saveWorkflow(job, def_xml, conf_xml):
+    try:
+        cursor.execute('INSERT INTO OOZIE_WF VALUES (?,?,?,?,?,?,?,?)', (job['jobid'], job['ChildJob'], job['JobPath'],  def_xml, conf_xml, "", job['JobCreation'], job['status']))
+        db_connection.commit()
+    except sqlite3.Error as e:
+        print("Error to insert action job:"+job, e.args[0])
+        logger.error("Error to insert action job:"+job, e.args[0])
+
+# Filter the coord Jobs based in the parameter  filter
+def filterCoordJob(line):
+    for filter in filters:
+        if line.find(filter) >= 0:
+            return True
+    return False
+
+# Determine the Job Type ex: 'C' is a Coordinate Job and 'W' is a Workflow Job
+def getJobType(job):
+    jobparts = job.split("-")
+    if len(jobparts) >= 4:
+        return jobparts[4]
+    else:
+        return "X"
+
+# Get the information from a Job, return a pandas dataframe with the job's information
+def getJobInfo(job):
+    logger.debug('getJobInfo() - Started Job='+job)
+    df = pd.DataFrame(columns=['ChildJob','Job','JobType','JobName','JobPath','JobCreation','status','JobStarted','CoordActionID','MatCNT'])
+    jobKey = 0
+    islist = False
+    jobType = getJobType(job)
+    cWorkFlow = ""
+    parentJobName = ""
+    parentJobPath = ""
+    parentJobCreated = ""
+    parentJobStatus = ""
+    parentJobStarted = ""
+    coordActionJobId = "0"
+    stdout, return_code = execCmd("oozie job -oozie " + oozie_url + " -info "+job+" -order desc -allruns")
+    if return_code == 0:
+        for line in stdout.splitlines():
+            logger.debug(line)
+            if line.startswith("Job Name"):
+                parentJobName = line[line.index(":")+1:].strip()
+                continue
+            if line.startswith("Workflow Name"):
+                parentJobName = line[line.index(":")+1:].strip()
+                continue
+            if line.startswith("App Path"):
+                parentJobPath = line[line.index(":")+1:].strip()
+                if jobType == 'C':
+                    if filterCoordJob(line):
+                        continue
+                    else:
+                        break
+            if line.startswith("Status"):
+                parentJobStatus = line[line.index(":")+1:].strip()
+                continue
+            if line.startswith("Created"):
+                parentJobCreated = line[line.index(":")+1:].strip()
+                continue
+            if line.startswith("Started"):
+                parentJobStarted = line[line.index(":")+1:].strip()
+                continue
+            if line.startswith("Start Time"):
+                parentJobStarted = line[line.index(":")+1:].strip()
+                continue
+            if line.startswith("CoordAction ID:"):
+                coordActionJobId = line[line.index(":")+1:].strip()
+                continue
+            if line.startswith("ID") and line.find("Status") >= 0 :
+                islist = True
+                continue
+            if islist and not line.startswith("-") and not line == "":
+                if jobType == 'C':
+                    #workFlow = line.split()
+                    jobs = re.findall(jobPattern,line)
+                    if len(jobs) >= 2:
+                        mat_cnt_patter = re.compile(r'@\d+')
+                        mat_cnt = re.findall(mat_cnt_patter,line)[0].split('@')[1]
+                        cWorkFlow = jobs[1]
+                        jobKey = jobKey + 1
+                        logger.debug("getJobInfo() - Job Child="+cWorkFlow+", Parent Job="+job+", Job Type="+jobType+", Parent Job Id="+parentJobName+", Parent Job Path="+parentJobPath+", Parent Job Created Date="+parentJobCreated+", Parent Job Status="+parentJobStatus+", Parent Job Start Date="+parentJobStarted+", Coord Job Id="+coordActionJobId)
+                        df.loc[jobKey, 'ChildJob'] = cWorkFlow
+                        df.loc[jobKey, 'jobid'] = job
+                        df.loc[jobKey, 'JobType'] = jobType
+                        df.loc[jobKey, 'JobName'] = parentJobName
+                        df.loc[jobKey, 'JobPath'] = parentJobPath
+                        df.loc[jobKey, 'JobCreation'] = parentJobCreated
+                        df.loc[jobKey, 'status'] = parentJobStatus
+                        df.loc[jobKey, 'JobStarted'] = parentJobStarted
+                        df.loc[jobKey, 'CoordActionID'] = coordActionJobId
+                        df.loc[jobKey, 'MatCNT'] = mat_cnt
+                if jobType == 'W':
+                    workFlow = line.split()
+                    if len(workFlow) > 0:
+                        jobs = re.findall(jobPattern,line)
+                        if len(jobs) >= 2:
+                            sbWorkFlowParts = jobs[1].split("-")
+                            if len(sbWorkFlowParts) >= 4:
+                                if sbWorkFlowParts[4][:1] == 'W':
+                                    cWorkFlow = sbWorkFlowParts[0]+"-"+sbWorkFlowParts[1]+"-"+sbWorkFlowParts[2]+"-"+sbWorkFlowParts[3]+"-"+sbWorkFlowParts[4][:1]
+                                    jobKey = jobKey + 1
+                                    #print(jobKey)
+                                    #print("getJobInfo() - Job Child="+cWorkFlow+", Parent Job="+job+", Job Type="+jobType+", Parent Job Id="+parentJobName+", Parent Job Path="+parentJobPath+", Parent Job Created Date="+parentJobCreated+", Parent Job Status="+parentJobStatus+", Parent Job Start Date="+parentJobStarted+", Coord Job Id="+coordActionJobId)
+                                    logger.debug(jobKey)
+                                    logger.debug("getJobInfo() - Job Child="+cWorkFlow+", Parent Job="+job+", Job Type="+jobType+", Parent Job Id="+parentJobName+", Parent Job Path="+parentJobPath+", Parent Job Created Date="+parentJobCreated+", Parent Job Status="+parentJobStatus+", Parent Job Start Date="+parentJobStarted+", Coord Job Id="+coordActionJobId)
+                                    df.loc[jobKey, 'ChildJob'] = cWorkFlow
+                                    df.loc[jobKey, 'jobid'] = job
+                                    df.loc[jobKey, 'JobType'] = jobType
+                                    df.loc[jobKey, 'JobName'] = parentJobName
+                                    df.loc[jobKey, 'JobPath'] = parentJobPath
+                                    df.loc[jobKey, 'JobCreation'] = parentJobCreated
+                                    df.loc[jobKey, 'status'] = parentJobStatus
+                                    df.loc[jobKey, 'JobStarted'] = parentJobStarted
+                                    df.loc[jobKey, 'CoordActionID'] = coordActionJobId
+                                else:
+                                    continue
+                            else:
+                                continue
+                        else:
+                            continue
+                    else:
+                        continue
+                else:
+                    continue
+            else:
+                continue
+    else:
+        logger.error("Error function getJobInfo() to get the info from Job id :"+job+ "- Return code :"+ str(return_code) + " Error Message "+stdout)
+    if len(df) == 0:
+        jobKey = 1
+        logger.debug("getJobInfo() - Job Child="+cWorkFlow+", Parent Job="+job+", Job Type="+jobType+", Parent Job Id="+parentJobName+", Parent Job Path="+parentJobPath+", Parent Job Created Date="+parentJobCreated+", Parent Job Status="+parentJobStatus+", Parent Job Start Date="+parentJobStarted+", Coord Job Id="+coordActionJobId)
+        df.loc[jobKey, 'ChildJob'] = cWorkFlow
+        df.loc[jobKey, 'jobid'] = job
+        df.loc[jobKey, 'JobType'] = jobType
+        df.loc[jobKey, 'JobName'] = parentJobName
+        df.loc[jobKey, 'JobPath'] = parentJobPath
+        df.loc[jobKey, 'JobCreation'] = parentJobCreated
+        df.loc[jobKey, 'status'] = parentJobStatus
+        df.loc[jobKey, 'JobStarted'] = parentJobStarted
+        df.loc[jobKey, 'CoordActionID'] = coordActionJobId
+    return df
+
+# Get the Job Definition XML and Job Configuration XML from a Job
+def getJobConf_Def(jobid):
+    logger.debug('getJobConf_Def() - Started Jobid='+jobid)
+    jobDef= ""
+    jobConf= ""
+    jobDefInfo = {}
+    jobConfInfo = {}
+    filePath = xml_files_folder+"/"+jobid
+    stdout, return_code = execCmd("oozie job -oozie " + oozie_url + " -definition " + jobid)
+    if return_code == 0:
+        jobDef = stdout.strip()
+        jobDefFile = filePath+"_def.xml"
+        jobDefInfo['filename'] = jobDefFile
+        jobDefInfo['xml'] = jobDef
+        if keep_files.lower == 'yes':
+            writeFile(filePath+"_def.xml",jobDef)
+    else:
+        logger.error("Error to extract Job Definitions, Jobid="+ jobid)
+        #logger.error("Return Code :"+return_code+" Error Message :"+stdout)
+        print("Error to extract Job Definitions, Jobid="+ jobid)
+        #print("Return Code :"+return_code+" Error Message :"+stdout)
+    stdout, return_code = execCmd("oozie job -oozie " + oozie_url + " -configcontent " + jobid)
+    if return_code == 0:
+        jobConf = stdout.strip()
+        jobConfFile = filePath+"_conf.xml"
+        jobConfInfo['filename'] = jobConfFile
+        jobConfInfo['xml'] = jobConf
+        if keep_files.lower == 'yes':
+            writeFile(jobConfFile,jobConf)
+    else:
+        logger.error("Error to extract Job Configurations, Jobid="+ jobid)
+        #logger.error("Return Code :"+return_code+" Error Message :"+stdout)
+        print("Error to extract Job Configurations, Jobid="+ jobid)
+        #print("Return Code :"+return_code+" Error Message :"+stdout)
+    return jobConfInfo, jobDefInfo
+
+# Return a Job Coordinate List
+def getCoordinatorList(filter):
+    coordList = []
+    if  len(filter) > 0:
+        statusFilter = 'status='+'status='.join( status +';' for status in filter.split(';'))[:-1]
+        if len(statusFilter) == 9 :
+            cmd = "oozie jobs -oozie " + oozie_url + " -jobtype 'coordinator' "
+        else:
+            cmd = "oozie jobs -oozie " + oozie_url + " -filter "+statusFilter+" -jobtype 'coordinator' "
+        logger.debug('Job Coordinator filter :'+statusFilter)
+    for offset in range(1,int(job_limite),50):
+        stdout, return_code = execCmd(cmd+"-offset "+ str(offset)+" -len 50")
+        if stdout.strip() == 'No Jobs match your criteria!':
+            #print(stdout.strip())
+            break
+        if return_code == 0:
+            for line in stdout.splitlines():
+                if line.startswith("-") or line.find("Job") >= 0:
+                    continue
+                else:
+                   lineSplit = line.split()
+                   coordList.append(lineSplit[0])
+        else:
+            logger.error("Error function getCoordinatorList() to get the coordinator list - Return code"+ str(return_code) + " Error Message "+stdout)
+            break
+    return  coordList
+
+# Parse the Job Configuration XML and return all properties in a key/value dictionary
+def parseConf(jobConf):
+    logger.debug('parseConf() - Started Config File = ')
+    #tree = etree.parse(confFilePath)
+    #root = tree.getroot()
+    tree =  etree.fromstring(jobConf)
+    properties={}
+    for property in tree.findall('property'):
+        name = property.find('name').text
+        value = property.find('value').text
+        properties[name]=value
+    logger.debug('parseConf() - End')
+    return properties
+
+# Parse the Job Definition XML from a sub-worflow action and return a list of job actions in a key/value dictionary
+def parseSubWfDef(jobid, subWFPath, properties):
+    logger.debug('parseSubWfDef() - Started Jobid='+jobid)
+    sbActionsList = []
+    filePath = xml_files_folder+"/"+"subWF_" + jobid
+    stdout, return_code = execCmd("hdfs dfs -cat " + subWFPath)
+    if return_code == 0:
+        subWF = stdout.strip()
+        if keep_files.lower == 'yes':
+            writeFile(filePath+"_def.xml",subWF)
+    else:
+        logger.error("Error to extract Job Definitions, Jobid="+ jobid)
+        print("Error to extract Job Definitions, Jobid="+ jobid)
+        return sbActionsList
+    sbXmldef = re.sub(r'\sxmlns="[^"]+"', '', subWF)
+    sbTree = etree.fromstring(sbXmldef)
+    for sbaction in sbTree.findall('action'):
+        sbActions = {}
+        sbAttribute = sbaction.attrib['name']
+        if sbaction.find('hive') or sbaction.find('sqoop'):
+            sbActions['jobid'] = jobid
+            sbActions['name'] = sbAttribute
+            sbActions['actionfrom'] = 'sub_workflow'
+            sbActions['appXML'] = getAppXml(sbXmldef, sbAttribute)
+            for sbTool in sbaction:
+                if sbTool.tag.find('hive') >=0:
+                    sbActions['type'] = 'hive'
+                    sbActions['scriptpath'] = paramToValue((sbTool.find('script').text),properties)
+                    #print(actions['script'])
+                    sbParamsList = (sbTool.findall('param'))
+                    sbActions['params'] = '|'.join(paramToValue(sbParam.text,properties) for sbParam in sbParamsList)
+                    sbActionsList.append(sbActions)
+                    #print('Params :'+actions['params'])
+                elif sbTool.tag.find('sqoop') >=0:
+                    sbActions['type'] = 'sqoop'
+                    achivelist  = sbTool.findall('archive')
+                    if len(achivelist) > 0:
+                        for archive in achivelist:
+                            achivePath = paramToValue(archive.text,properties)
+                            if achivePath.find('hdfs') >= 0:
+                                sbActions['scriptpath'] = achivePath
+                            else:
+                                sbActions['scriptpath'] = "N/A"
+                    else:
+                        sbActions['scriptpath'] = "N/A"
+                    sbArgList = (sbTool.findall('arg'))
+                    sbActions['params'] = '|'.join(paramToValue(sbArg.text,properties) for sbArg in sbArgList)
+                    if (sbActions['scriptpath'] != "N/A"):
+                        sbActionsList.append(sbActions)
+                    #print('Params :'+actions['params'])
+    return sbActionsList
+
+# Parse the Job Definition XML and return a list of job actions in a key/value dictionary
+def parseDef(jobid,jobdef, properties):
+    logger.debug('parseDef() - Started Config File = ')
+    actionsList = []
+    sbActionsList = []
+    #xmlstring = re.sub(r'\sxmlns="[^"]+"', '', open(defFilePath).read())
+    xmlstring = re.sub(r'\sxmlns="[^"]+"', '', jobdef)
+    tree = etree.fromstring(xmlstring)
+    for action in tree.findall('action'):
+        #print(action)
+        actions = {}
+        attribute = action.attrib['name']
+        #print('Attribute '+attribute)
+        #if attribute.find('export') >= 0 or attribute.find('sqoop') >= 0:
+        if action.find('hive') or action.find('sqoop') or action.find('sub-workflow'):
+            actions['jobid'] = jobid
+            actions['name'] = attribute
+            actions['actionfrom'] = 'workflow'
+            sub_count = 0
+            actions['appXML'] = getAppXml(xmlstring, attribute)
+            for tool in action:
+                if tool.tag.find('hive') >=0:
+                    actions['type'] = 'hive'
+                    actions['scriptpath'] = paramToValue((tool.find('script').text),properties)
+                    #print(actions['script'])
+                    paramsList = (tool.findall('param'))
+                    actions['params'] = '|'.join(paramToValue(param.text,properties) for param in paramsList)
+                    actionsList.append(actions)
+                    #print('Params :'+actions['params'])
+                elif tool.tag.find('sqoop') >=0:
+                    actions['type'] = 'sqoop'
+                    achivelist  = tool.findall('archive')
+                    if len(achivelist) > 0:
+                        for archive in achivelist:
+                            achivePath = paramToValue(archive.text,properties)
+                            if achivePath.find('hdfs') >= 0:
+                                actions['scriptpath'] = achivePath
+                            else:
+                                actions['scriptpath'] = "N/A"
+                    else:
+                        actions['scriptpath'] = "N/A"
+                    argList = (tool.findall('arg'))
+                    actions['params'] = '|'.join(paramToValue(arg.text,properties) for arg in argList)
+                    if (actions['scriptpath'] != "N/A"):
+                        actionsList.append(actions)
+                    #print('Params :'+actions['params'])
+                elif tool.tag.find('sub-workflow') >=0:
+                    sub_count += 1
+                    sub_properties = dict(properties)
+                    app = tool.find('app-path')
+                    cleanapp = paramToValue(app.text,properties)
+                    #print(cleanapp)
+                    configurations = tool.find('configuration')
+                    if configurations is not None:
+                        for config in configurations:
+                            sub_properties[config.find('name').text] = config.find('value').text
+                    sbActionsList = parseSubWfDef(jobid, cleanapp, sub_properties)
+                    for actions in sbActionsList:
+                        actionsList.append(actions)
+    logger.debug('parseDef() - End')
+    return actionsList
+
+def getAppXml(xml, actionName):
+    appxml = ""
+    if loglevel.upper() == 'DEBUG':
+        open = False
+        for line in xml.split('\n'):
+            if line.find("<action") >= 1 and line.find(actionName) >= 1:
+                open = True
+            elif line.find("</action>") >= 1 and open:
+                appxml = appxml +line
+                open = False
+            if open:
+                appxml = appxml +line
+    return appxml
+
+# Get the Job script action and download it from the Hadoop
+def getActionScript(scriptpath):
+    filename = scriptpath.split('/')[len(scriptpath.split('/'))-1]
+    filepath = hdfs_script_folder+'/'+filename
+    #print(filepath)
+    filestream=""
+    if os.path.isfile(filepath):
+        removeFileIfExist(filepath)
+    #stdout, return_code = execCmd("hdfs dfs -get "+scriptpath+" "+hdfs_script_folder)
+    stdout, return_code = execCmd("hdfs dfs -cat "+scriptpath)
+    if return_code == 0:
+        #filestream = open(hdfs_script_folder+'/'+filename, mode='r').read()
+        filestream = stdout
+    else:
+        logger.error('Error to get the hdfs file: '+scriptpath+' error message'+stdout)
+        print('Error to get the hdfs file: '+scriptpath+' error message'+stdout)
+    return filestream
+
+# Manage the Job Action harvest and save it in the sqllite database
+def getJobActions(jobid, jobConfFile, jobDefFile):
+    logger.debug('getJobActions() - Started Job Config File '+jobConfFile+' Job Definition File '+jobDefFile)
+    properties = {}
+    properties = parseConf(jobConfFile)
+    actionsList = parseDef(jobid,jobDefFile, properties)
+    for action in actionsList:
+        #print(action)
+        if (len(action['scriptpath']) != 0):
+            scriptFile = getActionScript(action['scriptpath'])
+        else:
+            scriptFile = ""
+        #print(action['params'])
+        if action['type'] == 'hive':
+            params =  getActionParamDict(action['params'])
+            script = paramToValue(scriptFile,params )
+            saveAction(action, script.strip(), scriptFile.strip())
+        else:
+            saveAction(action, scriptFile.strip(), scriptFile.strip())
+    db_connection.commit
+    logger.debug('getJobActions() - End')
+    return actionsList
+
+# Subfunction from getJobActions() to get the key/value params from the ActionList
+def getActionParamDict(action):
+    params = {}
+    actionParams = action.split('|')
+    for param in actionParams:
+        if param.find('=') >= 1:
+            params[param.split('=')[0]] = param.split('=')[1]
+    return params
+
+# Recursive function that get all sun job called from a coordinator and/or from a workflow
+# It will continue looking for  all jobs until find the last Job executed
+def getRecursiveJob(jobid,esp):
+    esp += esp
+    df = pd.DataFrame(getJobInfo(jobid))
+    count = 0
+    dfSize = 0
+    for jobrec in df.to_dict(orient='records'):
+        #print("counter "+str(count))
+        dfSize = len(df)
+        logger.debug("dataset size "+str(dfSize))
+        logger.debug("Job id " +jobrec['jobid'])
+        logger.debug("Child id " +jobrec['ChildJob'])
+        if len(re.findall(jobPattern,jobrec['ChildJob'])) == 1 and count <= dfSize:
+            print("Job id " +jobrec['jobid'])
+            count = count + 1
+            if len(esp) == 2:
+                print()
+                print("Job Coordinator "+"*"+jobrec['jobid'])
+            print("Parent Job "+jobrec['jobid']+" "+esp+"Child Job "+jobrec['ChildJob'])
+            logger.info("getRecursiveJob() - "+esp+jobrec['jobid'])
+            logger.info("getRecursiveJob() - Parent Job "+jobrec['jobid']+" "+esp+"Child Job "+jobrec['ChildJob'])
+            if getJobType(jobrec['jobid']) == 'C':
+                saveCoordinate(jobrec)
+            else:
+                saveWorkflow(jobrec, "","" )
+            getRecursiveJob(jobrec['ChildJob'],esp)
+        elif len(re.findall(jobPattern,jobrec['ChildJob'])) == 0 and len(re.findall(jobPattern,jobrec['jobid'])) == 1:
+            count = count + 1
+            if getJobType(jobrec['jobid']) != 'C':
+                #print("Parent Job "+jobrec['jobid']+" "+esp+"Child Job "+jobrec['ChildJob'])
+                print("Action Job Detected "+jobrec['jobid']+" Extrating content..... ")
+                logger.info("getRecursiveJob() - Action Job Detected "+jobrec['jobid']+" Extrating content..... ")
+                jobConf, jobDef = getJobConf_Def(jobid)
+                try:
+                    getJobActions(jobid, jobConf['xml'], jobDef['xml'])
+                    saveWorkflow(jobrec, jobDef['xml'], jobConf['xml'])
+                except KeyError:
+                    logger.info("Jobid "+jobid+" does not have a definition or configuration")
+                    continue    
+                #print("Child Job "+esp+i['ChildJob']+" Parent Job "+i['jobid'])
+            else:
+                continue
+        elif count > dfSize:
+            return
+
+# Main function to manage the entire script
+def main():
+    setUp()
+    coordList = getCoordinatorList(status_filter)
+    #print(coordList)
+    for coord in coordList:
+        getRecursiveJob(coord,"*")
+    db_connection.commit()
+    cursor.close()
+    db_connection.close()
+    print('******** Oozie Extract Job Ended : '+datetime.datetime.now().strftime("%Y%m%d_%H%M"))
+    logger.info('******** Oozie Extract Job Ended : '+datetime.datetime.now().strftime("%Y%m%d_%H%M"))
+
+if __name__ == "__main__":
+    main()
