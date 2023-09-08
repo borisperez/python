@@ -1,0 +1,615 @@
+#! /opt/anaconda/anaconda-notebooks/bin/python
+
+import os.path, shutil
+import sys, re, zipfile
+import argparse, sqlite3
+import logging,datetime,time,json,zipfile
+import endcutil
+
+# logging
+logger = logging.getLogger(__name__)
+
+class Context:
+    """ Class to load the context parameters to this process """
+    #def __str__(self): # Print Output
+        #return str(self.context)
+    def __init__(self, args):
+        self.context = dict()
+        self.args = args
+        self.util = endcutil.Util()
+        self.setUp()
+
+    def init_db(self, db):
+        """ Function to init the sqlite database """
+        try:
+            if db is not None:
+                if os.path.exists(db):
+                    self.conn = sqlite3.connect(db)
+                    logger.info("Database "+db+" already exist")
+                    print("Database "+db+" already exist")
+                    return self.conn
+                else:
+                    logger.info("Database "+db+" do not exist, creating database")
+                    print("Database "+db+" do not exist, creating database")
+                    self.conn = sqlite3.connect(db)
+                    cursor = self.conn.cursor()
+                    cursor.execute('CREATE TABLE HPF_EXTRACT_LOG (HPF_KEY TEXT, HPF_KEY_TEXT TEXT, HPF_TASK TEXT, HPF_LOG_PATH TEXT, TASK_PRESENT TEXT, \
+                        TASK_KEY TEXT, TASK_DATE TEXT, SCRIPT_HQL TEXT, SCRIPT_SQOOP TEXT, CMD_HDFS TEXT, SCRIPT_HQL_HASH TEXT, SCRIPT_SQOOP_HASH TEXT, EXEC_DATE TEXT)')
+                    cursor.execute('CREATE TABLE HPF_EXTRACT_LOG_ERROR (HPF_LOG_PATH TEXT, HPF_PARSE TEXT, ERROR TEXT, EXEC_DATE TEXT)')
+                    logger.debug('init_db() - Default Database used.')
+                    self.conn.commit()
+                    cursor.close()
+                    return self.conn
+        except sqlite3.Error as sqlerror:
+            logger.error('Error to initiate the sqllite database error '+sqlerror)
+            print('Error to create the sqllite database error '+sqlerror)
+            
+    def readContextFile(self, filePath):
+        """ Function to read the context file """
+        params = {}
+        try:
+            with open(filePath, mode="r") as r:
+                for line in r.read().splitlines():
+                    #print(line)
+                    if line.find('=') > 0 and line.find('#') == -1 and line.startswith('hpf'):
+                        (key, val) = line.split('=')
+                        if len(val.strip().split(',')) >1:
+                            params[key.strip()] = val.strip().replace('\"', '').split(',')
+                        elif len(val.strip().replace('\"', '')) >= 1:
+                            #print(key.strip())
+                            params[key.strip()] = val.strip().replace('\"', '')
+        except OSError as err:
+            print("OS error: {0}".format(err))
+            sys.exit()
+        except:
+            print("Unexpected error:", sys.exc_info()[0])
+        return params
+    
+    def showParams(self, dictionary):
+        """ Function to print the parameters set to this process """
+        for key, value in dictionary.items():
+            print('Parameter --> '+key+' = ', end=' ')
+            print(value)
+            logger.info('Parameter --> '+key)
+            logger.info(value)
+    
+    def setParams(self, dictionary, param):
+        """ Function to set the parameters comming from the context file """
+        for key, value in dictionary.items():
+            if key == param:
+                print('Parameter --> '+key+' = ', end=' ')
+                print(value)
+                return value
+            else:
+                continue
+
+    def kerb_auth(self, keytab, user): # kerberos authorization
+        """ Function to setUp the kerberos authentication """
+        if os.path.exists(keytab):
+            cmd = 'kinit -kt ' + keytab + ' ' + user
+            stdout, return_code = self.util.execCmd(cmd)
+            if return_code == 0:
+                logger.info('Kerberos Authentication Done ')
+            else:
+                logger.error('Failed to execute Kerberos Authentication'+stdout)
+            return return_code
+        else:
+              logger.error('Failed to execute Kerberos Authentication, keytab '+ keytab +' not exist') 
+    
+    def setUp(self):
+        """ Function to setUp the this process configuration """
+        print("Setup started")
+        args_context = self.readContextFile(self.args['context'])
+        self.args.update(args_context)
+        run_date = datetime.datetime.now().strftime("%Y%m%d_%H%M")
+        logname = "ENDC_HPF_EXTRACT"+"_"+run_date+".log"
+        self.conn = self.init_db(self.args['db'])
+        self.showParams(self.args)
+        loglevel = self.args['hpf_loglevel']
+        if loglevel is None:
+            loglevel='INFO'
+        else:
+            print('Parameter --> loglevel = '+loglevel)
+        level = getattr(logging, loglevel.upper().strip(), None)
+        if not isinstance(level, int):
+            raise ValueError('Invalid log level: %s'+level)
+        formatter = '%(asctime)s %(name)s.%(funcName)s %(levelname)s: %(message)s'
+        log_file = self.args['hpf_log_folder']+"/"+logname
+        #print(log_file)
+        logging.basicConfig(filename=log_file, filemode='w', level=level,format=formatter, datefmt='%d/%m/%Y %H:%M:%S')
+        logger.debug("Setup started")
+        logger.info('HPF Process Setup' + __file__)
+        logger.info('Start '+run_date)
+        #if  (self.args['hpf_edpp_keytab'] is not None and self.args['hpf_edpp_user'] is not None): 
+        #    self.kerb_auth(self.args['hpf_edpp_keytab'], self.args['hpf_edpp_user'])
+        #else:
+        #    logger.warning('Kerberos Authentication failed')
+        self.context = self.args
+        logger.info('******** HPF Extract Job Started : '+run_date)    
+        print('******** HPF Extract Job Started : '+run_date)
+        print()
+
+class Parse(Context):
+    """ Class to parse the HPF Log """
+    def __str__(self): # Print Output
+        return str(self.context)
+    def __init__(self, conn):
+        self.conn = conn
+        self.util = endcutil.Util()
+        self.line_re = re.compile("(^\d{4}-\d{2}-\d{2}\.\d{2}:\d{2}:\d{2} - \[[a-zA-Z0-9_-]* - [0-9]{1,}\])")
+        self.key_value_re = re.compile("(\[[a-zA-Z]*\]: \[.{1,}\] )", re.DOTALL)
+        self.present_re = re.compile("(\[INFO\]: [a-zA-Z0-9_?]* (is present|is not present,) )", re.IGNORECASE)
+        self.task_re = re.compile("\[INFO\] : TASK_CONFIG_FILE: .{1,}", re.DOTALL)
+        self.quey_re = re.compile("CREATE TABLE .{1,}|CREATE EXTERNAL TABLE .{1,}|INSERT OVERWRITE TABLE .{1,}", re.DOTALL)
+        self.use_re = re.compile("\[INFO\]: USE .{1,}", re.DOTALL)
+        self.sqoop_re = re.compile("Sqoop Command: .{1,}", re.DOTALL)
+        self.key_re = re.compile("(\[INFO\]: key: \w{1,})")
+        self.hadoop_distcp_re = re.compile('hadoop distcp .{1,}', re.DOTALL)
+        self.status_re = re.compile("FINAL-STATUS:.{1,}", re.DOTALL)
+    
+
+    def ehLogLine(self,line):
+        """ Function to check if the line in the log is a line to be parsed """
+        eh_line = re.search(self.line_re, line)
+        if eh_line is not None:
+            return True
+        else:
+            return False    
+    
+    def ehKey(self,line):
+        key = re.search(self.key_re, line)
+        if (key is not None):
+            return True
+        else:
+            return False
+    
+    def getPresent(self,line):
+        """ Function to parse the commands present (hive, sqoop, source, target... ) from the HPF log """
+        present = re.search(self.present_re, line)
+        if (present is not None):
+            if ( 'not' in present.group().lower()):
+                s_type=present.group().lower().split(" ")[1]
+                return "present_"+s_type, False
+            else:
+                s_type=present.group().lower().split(" ")[1]
+                return "present_"+s_type, True    
+        else:
+            return "", False
+    
+    def getTask(self,line):
+        """ Function to parse the task commands from the HPF log """
+        s_task = re.search(self.task_re, line)
+        if s_task is not None:
+            if ("yaml" in s_task.group() ):
+                ymltaskType = s_task.group().split("/")[-1]
+                taskType = ymltaskType.split(".")[0]
+                return taskType
+            else:
+                return None
+ 
+    
+    def cleanTmpTable(self, line, table):
+        """ Function to exchange the temp table with the source table in the tmp ddl statement """
+        if ('tmp_'+table in line):
+            return re.sub("tmp_"+table+"_\d{14}",table, line, flags=re.IGNORECASE).strip()
+        elif ('tmp_snapshot_'+table in line):
+            return re.sub("tmp_snapshot_"+table+"_\d{14}",table, line, flags=re.IGNORECASE).strip()
+        else:
+            return line    
+
+    def getSqoop(self,line, table):
+        """ Function to parse the sqoop commands from the HPF log"""
+        sqoop = re.search(self.sqoop_re, line)
+        if sqoop is not None:
+            cmd = sqoop.group().replace("Sqoop Command: ", "").strip('][')
+            sqoop = self.cleanTmpTable(cmd,table)
+            if 'eval' not in sqoop[2]:
+                return sqoop, True
+            else: 
+                return "", False
+        else:
+            return "", False
+
+    def getHadoop(self, line):
+        """ Function to parse the hadoop commands from the HPF log"""
+        hadoop_cmd = re.search(self.hadoop_distcp_re, line)
+        #print(hadoop_cmd)
+        if hadoop_cmd is not None:
+            return hadoop_cmd.group()
+        else:
+            return None    
+    
+    def getKeyValues(self,line):
+        """ Function to parse the keys values from the HPF log"""
+        key = re.search(self.key_value_re, line)
+        logger.debug("Key is: "+str(key))
+        #print("Key is: "+str(key))
+        if (key is not None):
+            key_line = key.group()
+            logger.debug("Key line is: "+str(key_line))
+            key_value = key.group().strip().replace(" ","").replace("[","").replace("]","").split(":")
+            logger.debug("Key Value  is: "+str(key_value))
+            if ('[target]' in line):
+                logger.debug("[target] " + "target_"+str(key_value[0])+" value "+str(key_value[1]))
+                return 'target_'+key_value[0], key_value[1]
+            elif ('[source]' in line):
+                logger.debug("[source] " + "source_"+str(key_value[0])+" value "+str(key_value[1]))
+                return 'source_'+key_value[0], key_value[1]
+            else:
+                return "N", "N"    
+        else:
+            return "N", "N" 
+    
+    def ehQuery(self,line):
+        """ Function to check if the line from the log is part of a query stantment"""
+        query = re.search(self.quey_re, line)
+        if (query is not None):
+            return True
+        else:
+            return False
+    
+    def getUse(self,line):
+        """ Function to get the USE hive command from the parse """
+        s_use = re.search(self.use_re, line)
+        if s_use is not None:
+            if len(s_use.group().strip().replace(" ", "")) > 0:
+            #print(" get USE "+s_use.group().split(":")[1].lstrip())
+                return s_use.group().split(":")[1].lstrip()
+        else:
+            return None
+
+    def getParseKey(self, parse):
+        """ Function to get the keys from the parse """
+        logkey = []
+        if ('task' in parse):
+            logkey.append('task='+parse['task'])
+        else:
+            logger.warning('task name do not exist')
+        if ( 'key_values' in parse.keys() ):
+            parseKeys = parse['key_values']
+            if ( 'source_schema' in parseKeys ):
+                logkey.append('source_schema='+parseKeys['source_schema'])
+            else:
+                logger.warning('source schema do not exist') 
+            if ( 'source_table' in parseKeys):
+                logkey.append('source_table='+parseKeys['source_table'])
+            else:
+                logger.warning('source table do not exist')
+            if ( 'source_view' in parseKeys):
+                logkey.append('source_view='+parseKeys['source_view'])
+            else:
+                logger.warning('source table do not exist')  
+            if ( 'target_databaseName' in parseKeys ):
+                logkey.append('target_databaseName='+parseKeys['target_databaseName'])
+            elif ( 'target_schema' in parseKeys):
+                logkey.append('target_schema='+parseKeys['target_schema'])
+            else:
+                logger.warning('target schema/database do not exist')  
+            if ( 'target_table' in parseKeys ):
+                logkey.append('target_table='+parseKeys['target_table'])
+            else:
+                logger.warning('target table do not exist')
+        if len(logkey) >= 1:
+            key =  '|'.join(logkey)
+            return self.util.hash(key), key
+        else:
+            return 'N','N'
+    
+    def getValueFromList(self, parse, string):
+        """ Function to transform a list ina string """
+        if (string in parse):
+            value = parse[string]
+            if value is not None:
+                valuetext = '\n'.join(value)
+                return valuetext
+            else:
+                return "N"
+        else:
+            return "N"
+    
+    def getValueFromDict(self, parse, string):
+        """ Function to get the values from a dictionary putting in a string"""
+        if ( string in parse ):
+            #print('Entrei getvalue')
+            d = parse[string]
+            valuetext = '\n'.join( d[key] for key in d)
+            if valuetext is not None:
+                return valuetext
+            else:
+                return "N"
+        else:
+            return "N"
+    
+    def saveParse(self, conn, parse, gethashkey, textkey,hqlhash, hqlscript, sqoophash, sqoopscript,hadoopcript):
+        """ Function Save the HPF parse log info in the sqlite table HPF_EXTRACT_LOG """
+        keys = '|'.join(str(item) for item in dict(parse['key_values']).items())
+        present = '|'.join(str(item).replace(',',':') for item in dict(parse['present']).items())
+        exec_date = datetime.datetime.now().strftime("%Y%m%d_%H%M")
+        try:
+            cursor = conn.cursor()
+            cursor.execute('INSERT INTO HPF_EXTRACT_LOG VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)' , ( gethashkey, textkey, parse['task'], \
+                 parse['log_file'], present, keys , parse['date'], hqlscript, \
+                     sqoopscript, hadoopcript, hqlhash, sqoophash, exec_date))
+            rows = cursor.rowcount
+            conn.commit()
+            cursor.close
+            return rows
+        except sqlite3.Error as e:
+            print("Error to insert HPF Map Key :"+textkey, e.args[0])
+            logger.error("Error to insert HPF Map Key :"+textkey, e.args[0])
+
+    def saveError(self, conn, parse, error):
+        parseText = '|'.join(str(item) for item in dict(parse).items())
+        exec_date = datetime.datetime.now().strftime("%Y%m%d_%H%M")
+        """ Function Save the HPF parse log Error in the sqlite table HPF_EXTRACT_LOG """
+        try:
+            cursor = conn.cursor()
+            cursor.execute('INSERT INTO HPF_EXTRACT_LOG_ERROR VALUES (?,?,?,?)' , ( parse['log_file'], parseText, error, exec_date))
+            rows = cursor.rowcount       
+            conn.commit()
+            cursor.close
+            return rows
+        except sqlite3.Error as e:
+            print("Error to insert HPF Ext Log Error :", e.args[0])
+            logger.error("Error to insert HPF Ext Log Error :", e.args[0])
+
+    def getStatus(self, line):
+        """ Function to get the status from a HTF process log  """
+        status = re.search(self.status_re, line)
+        if (status is not None):
+            return status.group().split(':')[-1]
+        else:
+            return 'N'
+
+    def getSourceTable(self, key_values):
+        if 'source_table' in key_values:
+            return key_values['source_table']
+        elif 'source_view' in key_values:
+            return key_values['source_view']
+        else:
+            return "N"
+
+    def parseLog(self, log):
+        """ Function to parse the logs """
+        parse = {}
+        key_values = {}
+        present = {}
+        hqls = {}
+        hql = []
+        use = []
+        sqoop = []
+        hadoop = []
+        query_flag = False
+        hql_count = 0
+        with open(log, "r") as file:
+            logger.info('Start Parse log '+log)
+            for line in file:
+                if self.ehLogLine(line):
+                    query_flag = False
+                    if ('TASK_CONFIG_FILE' in line):
+                        #logger.debug("Task line: " + line)
+                        task = self.getTask(line)
+                        if task is not None:
+                            parse['task'] = task
+                            logger.debug("Task Defined: " + task)
+                            ehline = re.search(self.line_re, line)
+                            parse['date'] = ehline.group().split('.')[0]
+                            logger.debug("Date Defined: " + str(ehline.group().split('.')[0]))
+                            continue
+                        else:
+                            logger.warning("Did not get Task neither Date: " + line)
+                            continue
+                    if ('present' in line):
+                        s_type, value = self.getPresent(line)
+                        if value is not None:
+                            logger.debug("Present type "+ s_type + "value "+str(value))
+                            present[s_type] = value
+                            continue
+                        else:
+                            logger.warning("Did not get present: " + line)
+                    if ('Key' in line):
+                        key, value = self.getKeyValues(line)
+                        if value is not None:
+                            key_values[key] = value
+                            logger.debug("eh key "+ key + " value "+str(value))
+                            continue
+                        else:
+                            logger.warning("Did not get Key : " + line)
+                    if ('USE' in line ) and ('default' not in line):
+                        use_line = self.getUse(line)
+                        if use_line is not None:
+                            use.append(use_line)
+                            logger.debug("Use schema "+ use_line)
+                            continue
+                        else:
+                            logger.warning("Did not get USE :" + line)
+                    if ('sqoop' in line and 'export' in line and 'eval' not in line):
+                        cmd, valid = self.getSqoop(line, self.getSourceTable(key_values))
+                        if valid:
+                            sqoop.append(cmd)
+                            logger.debug("Valid sqoop cmd "+ ' '.join(cmd))
+                        else:
+                            logger.warning("Sqoop command not valid :" + line)   
+                    if ('hadoop' in line):
+                        logger.debug("Hadoop line: " + line)
+                        hadoop_cmd = self.getHadoop(line)
+                        if hadoop_cmd is not None:
+                            hadoop.append(hadoop_cmd)
+                        else:
+                            logger.warning("Hadoop not inserted :" + line)
+                    if ('FINAL-STATUS' in line):
+                        hpf_status = self.getStatus(line)
+                        if hpf_status is not None:
+                            parse['status'] = hpf_status
+                        else:
+                            logger.warning("Did not get hpf status :" + line)
+                elif ((self.ehQuery(line) or query_flag) and ('present_hive' in present)):
+                    query_flag = True
+                    s_table = self.getSourceTable(key_values)
+                    hql.append(self.cleanTmpTable(line, s_table))
+                    if (len(line.strip().replace(" ","")) == 0):
+                        #print("quey abacou "+line)
+                        query_flag = False
+                        hql_count += 1
+                        hql_str = '\n'.join(hql)
+                        if len(use) == 0:
+                            use.append("USE `"+key_values['source_schema']+"`")
+                        #print(use)
+                        hqls['hql_'+str(hql_count)] = use[-1]+'\n'+hql_str
+                        logger.debug("End HQL: "+ str(use[-1])+'\n'+str(hql_str)) 
+                        hql = []
+            if len(present) > 0:
+                parse['present'] = present
+            if len(key_values) > 0:
+                parse['key_values'] = key_values
+            if len(sqoop) > 0:
+                parse['sqoop'] = sqoop
+            if len(hqls) > 0:
+                parse['hql'] = hqls    
+            if len(hadoop) > 0:
+                parse['hadoop'] = hadoop
+            #print('\n'.join(use+hql))
+            #print(parse)
+            parse['log_file'] = log
+            return dict(parse)
+            #print(key_values[source_columns])
+
+    def validParse(self, parse):
+        """ Function to validate the parse main keys """
+        if (self.checkKey(parse, 'task') and self.checkKey(parse, 'key_values') and \
+            self.checkKey(parse, 'log_file') and self.checkKey(parse, 'status')):
+            return True
+        else:
+            return False
+
+    def checkKey(self, dict, key):
+        """ Function to check if the key exist in a dictionary """
+        if key in dict.keys():
+            return True
+        else:
+            return False
+
+    def run(self, file ):
+        error = ""
+        parse = self.parseLog(file)
+        if (self.validParse(parse)):
+            if 'status' in parse:
+                status = parse['status']
+                if ('SUCCESSFUL' in status ):
+                    print('HPF Log File '+file+' status '+str(parse['status']))
+                    logger.debug('HPF Log File '+file+' status '+str(parse['status']))
+                    hashkey, textkey =  self.getParseKey(parse)
+                    hqlscript = self.getValueFromDict(parse, 'hql')
+                    sqoopscript = self.getValueFromList(parse, 'sqoop')
+                    hadoopcript = self.getValueFromList(parse, 'hadoop')
+                    rows = self.saveParse(self.conn, parse, hashkey, textkey, self.util.hash(hqlscript), hqlscript,self.util.hash(sqoopscript), sqoopscript,hadoopcript)
+                    return rows, 0
+                else:
+                    error = "Log with status different from SUCCESSFUL "
+                    logger.error(error)
+                    self.saveError(self.conn, parse,error )
+                    return 0, 1
+            else:
+                error = "Log without status "
+                logger.error(error)
+                self.saveError(self.conn, parse,error )
+                return 0, 1
+        else:
+            error = "Parse Log did not passed in the validation (task, key_values,log_file, status) "
+            logger.error(error)
+            self.saveError(self.conn, parse,error )
+            return 0, 1
+        
+def moveProcessed(filePath, processedPath):
+    try:
+        logger.info("Moving file log "+filePath+" to processed folder :"+processedPath)
+        shutil.move(filePath,processedPath )
+    except OSError as err:
+        logger.warning("Error to move file log "+filePath+" to processed folder :"+processedPath, err.args[0])
+
+def zipLog (logpath):
+    zipf = None
+    if os.path.exists(logpath):
+        try:
+             zipf = zipfile.ZipFile(logpath+'.zip', 'w', zipfile.ZIP_STORED)
+             os.remove(logpath)
+        except zipfile.BadZipfile:
+            logger.info("Process could not compress file "+logpath)
+    else:
+        logger.info("Process to compress file "+logpath+" file do not exist.")
+    return zipf
+
+def logParsed(conn):
+    """ Function to get all logs already processed to filter in case reprocessed"""
+    try:
+        cursor = conn.cursor()
+        cursor.execute('SELECT DISTINCT HPF_LOG_PATH FROM HPF_EXTRACT_LOG')
+        rows = cursor.fetchall()   
+        cursor.close
+        return rows
+    except sqlite3.Error as e:
+        print("Error to QUERY HPF Map TABLE :", e.args[0])
+        logger.warning("Error to insert HPF Map Key :", e.args[0])
+
+def searchLogs(c):
+    """ Function to search all logs that need to be parsed """
+    args = dict(c.context)
+    logsproc = logParsed(c.conn)
+    #print(logsproc)
+    logs_files = []
+    log_filter = re.compile(r".{1,}\.log\.taskDone$", re.DOTALL)
+    p = Parse(c.conn)
+    count_rows = 0
+    count_rows_error = 0
+    processed = args['hpf_processed']
+    move=args['hpf_move_processed']
+    for path, subdirs, files in os.walk(args['hpf_log_root_folder']):
+        for file in files:
+            log = re.search(log_filter, file)
+            if (log is not None ):
+                logfile = os.path.join(path, file)
+                logger.debug("Log File name "+log.group()+" found.")
+                if (file not in logsproc):
+                    print('Parsing log file :'+logfile)
+                    logger.debug("Parsing log file : "+logfile)
+                    rows, rows_error = p.run(logfile)
+                    count_rows += rows
+                    count_rows_error += rows_error
+                    if (move == "yes"):
+                        processedFile = os.path.join(processed, file)
+                        moveProcessed(logfile, processedFile)
+                        zipedFile = zipLog(processedFile)
+                        logger.debug("Log file : "+logfile+" moved to "+processedFile)
+                    continue
+                else:
+                    print("Log File was parsed before and wont be parsed anymore"+logfile)
+                    logger.debug('Log File was parsed before and wont be parsed anymore'+logfile)
+                    if (move == "yes"):
+                        processedFile = os.path.join(processed, file)
+                        moveProcessed(logfile, processedFile)
+                        zipedFile = zipLog(processedFile)
+                        logger.debug("Log file : "+logfile+" moved to "+processedFile)
+                    continue
+            else:
+                logger.warning("File name "+file+" do not match Log standard with end .log.taskDone ")
+                continue
+    print('Parses inserted in HPF Extract LOG:'+str(count_rows))
+    logger.info('Parses inserted in HPF Extract LOG:'+str(count_rows))
+    print('Parses with error in HPF Extract LOG:'+str(count_rows_error))
+    logger.info('Parses with error in HPF Extract LOG:'+str(count_rows_error))      
+    return str(count_rows)
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser()
+    #parser.add_argument('-c','--context', type=str,  default='C:/talend/7.0.1/workspace/runtime/context/Default/ENDC_EXT_HPF/context.txt') #required=True,
+    #parser.add_argument('-d','--db', type=str, default='C:\\talend\\7.0.1\\workspace\\db\\ENDC_EXT_HPF_MAP\\endc_mir_default_oozie_actions.sqlite')
+    parser.add_argument('-c','--context', type=str, required=True, default='/opt/talend-mm-agent/edc_talend/context/ENDC_EXT_HPF/context.txt')
+    parser.add_argument('-d','--db', type=str, default='/opt/talend-mm-agent/edc_talend/data/ENDC_HPF_LOG_EXTRACT/db/endc_mir_default_hpf_actions.sqlite')
+    context = Context(vars(parser.parse_args()))
+    qtd_logs = searchLogs(context)
+    logger.info("HPF Extract Job Parsed "+qtd_logs+" Logs")
+    logger.info("******** HPF Extract Job Ended : "+datetime.datetime.now().strftime("%Y%m%d_%H%M"))
+
+if __name__ == "__main__":
+    main()
