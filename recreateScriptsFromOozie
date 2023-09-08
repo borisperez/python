@@ -1,0 +1,285 @@
+from pathlib import Path
+import argparse, os, re, datetime, subprocess,sys, sqlite3
+import logging
+logger = logging.getLogger(__name__)
+
+class InitDB:
+    """ Initiate the sqlite db created by the TDS Job and create the table OOZIE_ACTION_MAP in this db """
+    def __init__(self, args):
+        self.db = args['db']
+        self.connection = sqlite3.connect(self.db)
+        self.cursor = self.connection.cursor()
+        self.cursor.execute('DROP TABLE IF EXISTS OOZIE_ACTION_MAP')
+        self.cursor.execute('CREATE TABLE OOZIE_ACTION_MAP(SOURCE_NAME TEXT, TARGET_NAME TEXT, SOURCE_SCHEMA TEXT, TARGET_SCHEMA TEXT, SOURCE_MODEL TEXT, TARGET_MODEL TEXT, COLUMN TEXT, POSITION TEX, DESCRIPTION TEXT, DATABASE TEXT, SQOOP_TYPE TEXT)')
+
+
+class Do():
+    """ Utility class with common functions to attend both CreateHiveScript and CreateSqoopScript"""
+    logger.debug("Do function started...")
+    def __init__(self, args):
+        self.path = args['path']
+
+    def dirMaker(self, path):
+        logger.debug("dirMaker path: "+path)
+        if os.path.isdir(path) == False:
+            Path(path).mkdir(parents=True, exist_ok=True)
+
+    def removeFileIfExist(self, pathfile):
+        logger.debug("remove file if exist : "+pathfile)
+        try: 
+            os.remove(pathfile) 
+            print("% s removed successfully" % pathfile) 
+        except OSError as error: 
+            print(error) 
+            logger.error("File "+pathfile+" path can not be removed")
+
+    def writeScript(self, pathfile, rows):
+        logger.debug('writeFile() - Started File='+pathfile)
+        if os.path.isfile(pathfile):
+            logger.warning("File "+pathfile+" already exist. Removing file...")
+            self.removeFileIfExist(pathfile)
+        try:
+            with open(pathfile, mode="w+") as w:
+                w.writelines(rows)
+        except OSError as err:
+            print("OS error: {0}".format(err))
+        except:
+            print("Unexpected error:", sys.exc_info()[0])
+
+class CreateHiveScript(Do):
+    """ CreateHiveScript Class to read the script extracted from Oozie/HDFS, 
+    clean and generate it in EDC agent server to be imported by Talend DataCatalog Bridge"""
+    def __init__(self,args,db):
+        logger.debug("CreateHiveScript started")
+        self.path = args['path']
+        self.Do = Do(args)
+        self.connection = db.connection  
+        self.cursor = db.connection.cursor()
+
+    def queryHiveAction(self):
+        """ Function query the sqlite table OOZIE_ACTION_HIVE genareted by the TDS job with the Hive scripts. """
+        logger.debug("Querying Hive Action sqlite Table : ")
+        self.cursor.execute("select MALCODE, SCRIPT_NAME, SCRIPT_CLOB from OOZIE_ACTION_HIVE")
+        rows = self.cursor.fetchall()
+        self.hivecount = len(rows)
+        logger.debug("Hive Action Table count: "+str(len(rows)))
+        #print(rows)
+        return rows
+
+    def clean(self, line):
+        """ Function clean the function concat_ws from the hive scripts. """
+        cleanline = line
+        sp = re.compile(r"(\()")
+        ep = re.compile(r"(\))")
+        vp = re.compile(r"(,''\))")
+        gp = re.compile(r"(''\)\),)")
+        hp = re.compile(r"(case\s+when\s)")
+        p_concat = re.compile(r'concat_ws\(', re.IGNORECASE)
+        p_coalece = re.compile(r'coalesce\(', re.IGNORECASE)
+        if (len(re.findall(p_concat,line.lower())) > 0):
+            cleanline = line.lower().replace(" ","").replace("concat_ws('\\b',", "").replace("concat_ws('\x08',", "")
+        if (line.replace(" ","").find(")") == 0):
+            if (len(line.replace(" ","")) == 1):
+                cleanline = line.replace(" ","").replace(")","")
+            if (len(line.replace(" ","")) == 2):
+                cleanline = line.replace(" ","").replace(");",";")        
+        #print(cleanline)
+        return cleanline
+    
+    def runMakeHQLScripts(self):
+        """ Function execute the hive script genaretion. """
+        logger.debug("runMakeHQLScripts started")
+        rows = self.queryHiveAction()
+        self.concat_ws = []
+        hqlcount = 0
+        for records in rows:
+            hqlcount += 1
+            #print(records)
+            malcode = records[0]
+            hql_name = records[1]
+            path = self.path+"/hql/"+malcode
+            self.Do.dirMaker(path)
+            hqlClean = path+"/"+hql_name
+            logger.info("Creating HQL Script "+hqlClean)
+            count = 0
+            lines = []
+            cleanlines = []
+            for line in records[2].split('\n'):
+                if (count == 0):
+                    lines.append("/* script commented " + "\n")
+                    lines.append(line + "\n")
+                    cleanlines.append(self.clean(line) + "\n")                
+                else:
+                    lines.append(line + "\n")
+                    cleanlines.append(self.clean(line) + "\n")
+                count = count + 1   
+            with open(hqlClean, mode="w+") as w:
+                lines.append("\n" + "*/" + "\n")
+                w.writelines(lines)
+                w.writelines(cleanlines)
+        self.hqlcount = hqlcount
+
+
+class CreateSqoopScript(Do):
+    """ This CreateHiveScript Class, read the Sqoop parameters and Columns files extracted from Oozie/HDFS, 
+    and generate the sqoop scripts in EDC agent server to be imported by Talend DataCatalog Bridge. """
+    def __init__(self,args,db):
+        logger.debug("CreateSqoopScript started")
+        self.path = args['path']
+        self.Do = Do(args)
+        self.connection =  db.connection   
+        self.cursor = db.connection.cursor()
+
+    def saveOozieActionsMap(self, params, column,source_model,target_model, position ):
+        """ Function Save the Sqoop params info in the sqlite table OOZIE_ACTION_MAP """
+        try:
+            self.cursor.execute('INSERT INTO OOZIE_ACTION_MAP VALUES (?,?,?,?,?,?,?,?,?,?,?)' , ( params['tabledir'], params['tableName'], \
+                params['tabledir'],params['schema'],source_model, target_model, column, position,params['username'],params['database'],params['sqoop_type']))
+            self.connection.commit()
+        except sqlite3.Error as e:
+            print("Error to insert action Map Table Name :"+params['tableName'], e.args[0])
+            logger.error("Error to insert action Map Table Name:"+params['tableName'], e.args[0]) 
+
+    def getParamsValues(self, paramLine, columnLine):
+        """ Function get Sqoop params values in order to produce the sqoop script. """
+        logger.debug("getParamsValues started")
+        previousLine = ""
+        params = {}
+        #print(columnLine.find("--columns"))
+        params['sqoop_line_delimiter'] = "--input-lines-terminated-by \'\\b\'"
+        params['sqoop_field_delimiter'] = "--input-fields-terminated-by \',\'"
+    
+        for line in paramLine.split("|"):
+            if (line == 'export') or (line == 'import') or (line == 'import-all-tables') or (line == 'merge'):
+                params['sqoop_type'] = line
+            if (previousLine == "--connect"):
+                a = line.split("/")
+                b = a[len(a)-1].split(".")[0]
+                params['database'] = b
+                params['sqoop_connect'] = "--connect "+line
+            elif (previousLine == "--username"):
+                params['username'] = line
+                params['sqoop_username'] = "--username "+ line
+            elif (previousLine == "--password-file"):
+                params['sqoop_password'] = "--password-file "+ line  
+            elif (previousLine == "--export-dir"):
+                params['tabledir'] = line
+                params['sqoop_tabledir'] = "--export-dir "+line
+            elif (previousLine == "--table"):
+                if (len(line.split(".")) == 2):
+                    params['schema'] = line.split(".")[0]
+                    params['tableName'] = line.split(".")[1]
+                params['sqoop_table'] = "--table "+line
+            elif (columnLine.find("--columns")) >= 0:
+                params['sqoop_columns'] = columnLine.replace("\n", "").replace("\\", "").replace("--columns",  "--columns \"")+" \""
+            previousLine = line
+        return params
+    
+    def getColumn(self, columnLine):
+        """ Function get Sqoop columns in order to produce the sqoop script. """
+        columns = []
+        for line in columnLine.split('\n'):
+            if (line != "--columns"):
+                columns.append(line.split(",")[0])
+        return columns
+    
+    def createSqoopScripts(self, params,sqoopScriptPath):
+        """ Function decide what type of Sqoop  script will be generated ex: export/import. """
+        if (params['sqoop_type'] is None):
+            return None
+        elif (params['sqoop_type'] == 'export' ):
+            logger.info("Creating Export Sqoop Script "+params['sqoop_table'])
+            self.writeScript(sqoopScriptPath, self.createSqoopExport(self.validSqoop(params)))
+        else:
+            print("Sqoop Type not estimate yet "+params['sqoop_type'])    
+    
+    def validSqoop(self, params):
+        """ Validate the Sqoop params. """
+        if (params['sqoop_type'] is None):
+            return None
+        if (params['sqoop_connect'] is None):
+            return None
+        if (params['sqoop_tabledir'] is None):
+            return None
+        if (params['sqoop_table'] is None):
+            return None
+        if (params['sqoop_columns'] is None):
+            return None
+        if (params['sqoop_username'] is None):
+            params['sqoop_username'] = "--username TDCRPT"
+        if (params['sqoop_password'] is None):
+            params['sqoop_password'] = "--password-file /apps/talend/password/password.txt"    
+        if (params['sqoop_field_delimiter'] is None):
+            params['sqoop_field_delimiter'] = "--input-fields-terminated-by \',\'"
+        if (params['sqoop_line_delimiter'] is None):
+            params['sqoop_line_delimiter'] = "--input-lines-terminated-by \'\\n\'"
+        return params
+    
+    def createSqoopExport(self, params):
+        """ Function generate the Sqoop export script. """
+        script = 'sqoop export '+params['sqoop_connect']+" \\"+'\n'+params['sqoop_username'] \
+        +" \\"+'\n'+params['sqoop_password']+" \\"+'\n'+params['sqoop_table']+" \\"+'\n'+params['sqoop_columns'] \
+        +" \\"+'\n'+params['sqoop_tabledir']+" \\"+'\n'+params['sqoop_field_delimiter']+" , "+params['sqoop_line_delimiter']
+        return script
+    
+    #cursor.execute("select MALCODE, SCRIPT_NAME, SCRIPT_CLOB from OOZIE_ACTION_HIVE WHERE MALCODE = 'vpls' and SCRIPT_NAME = 'export_VPLS_ACCT_EDPP_RRDW_BRIDGE.hql'")
+
+    def querySqoopAction(self):
+        """ Function query the sqlite table OOZIE_ACTION_SQOOP genareted by the TDS job with the Sqoop params and columns. """
+        logger.debug("Querying Sqoop Action Table OOZIE_ACTION_SQOOP started")
+        self.cursor.execute("select MALCODE, SCRIPT_NAME, ACTION_PARAM, SCRIPT_CLOB from OOZIE_ACTION_SQOOP")
+        rows = self.cursor.fetchall()
+        #print(len(rows))
+        self.sqoopcount = len(rows)
+        return rows
+
+    def runMakeSqoopScripts(self):
+        """ Function execute the sqoop script genaretion. """
+        rows = self.querySqoopAction()
+        sqcount = 0
+        for records in rows:
+            sqcount += 1
+            rows = {}
+            #print(records)
+            malcode = records[0]
+            sqoop_name = records[1].split(".")[1]
+            params = self.getParamsValues(records[2], records[3])
+            columns = self.getColumn(records[3])
+            position = 0
+            sqoopScriptPath = self.path+"/sqoop/"+malcode
+            self.Do.dirMaker(sqoopScriptPath)
+            sqoopScript = sqoopScriptPath+"/"+sqoop_name+".sqoop"
+            logger.info("Creating Sqoop Script "+sqoopScript)
+            #print(sqoopScript)
+            self.createSqoopScripts(params,sqoopScript)
+            for column in columns:
+                position += 1
+                #print(params['tabledir']+" - "+params['database']+" - "+params['schema']+" - "+params['tableName']+" - "+column+" - "+str(position)+" - "+params['sqoop_type'])
+                self.saveOozieActionsMap(params, column,source_model,target_model,position )
+        self.sqcount = sqcount
+
+
+if __name__ == "__main__":
+    source_model = ''
+    target_model = ''
+    db = ''
+    run_date = datetime.datetime.now().strftime("%Y%m%d_%H%M")
+    logname = "ENDC_OOZIE_EXT_SQOOP_HIVE_SCRIPT"+"_"+run_date+".log"
+    parser = argparse.ArgumentParser()
+    parser.add_argument('-g','--logpath', type=str, default='c:/Users/PEREZB2/OneDrive - The Toronto-Dominion Bank/Documents/TD/Talend/AMCB/logs')
+    parser.add_argument('-l','--loglevel', type=int, default='10')
+    parser.add_argument('-d','--db', type=str, default='C:\\talend\\7.0.1\\workspace\\db\\ENDC_EXT_OOZIE_MAP\\endc_mir_prod_oozie_actions.sqlite')
+    parser.add_argument('-p','--path', type=str, default='C:/Users/PEREZB2/OneDrive - The Toronto-Dominion Bank/Documents/TD/Talend/AMCB/doddfrank_projects')
+    args = vars(parser.parse_args())
+    log = args['logpath']+"/"+logname
+    logging.basicConfig(level=args['loglevel'], filename=log, format='%(asctime)s %(name)s.%(funcName)s %(levelname)s: %(message)s', datefmt='%d/%m/%Y %H:%M:%S')
+    logger.info('******** Oozie Extract Hive and Sqoop Creation Started : ')
+    db = InitDB(args)
+    sqoop = CreateSqoopScript(args, db)
+    sqoop.runMakeSqoopScripts()
+    hive = CreateHiveScript(args, db)
+    hive.runMakeHQLScripts()
+    logger.info("Number of sqoop script found :"+str(sqoop.sqoopcount)+" Number of sqoop scripts created :"+str(sqoop.sqcount))
+    logger.info("Number of Hive script found :"+str(hive.hivecount)+" Number of hql scripts created :"+str(hive.hqlcount))
+    print('******** Oozie Extract Hive and Sqoop Creation Started : '+datetime.datetime.now().strftime("%Y%m%d_%H%M"))
+    logger.info('******** Oozie Extract Hive and Sqoop Creation End : '+datetime.datetime.now().strftime("%Y%m%d_%H%M"))
